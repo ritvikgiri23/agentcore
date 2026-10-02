@@ -15,6 +15,14 @@ def run_channel(run_id: str) -> str:
     return f"run:{run_id}:events"
 
 
+DONE = "done"
+
+
+def done_event(status: RunStatus) -> dict[str, Any]:
+    """The terminal event: tells live subscribers the run is over. Never persisted."""
+    return {"step_type": DONE, "status": status.value}
+
+
 def step_event(step: RunStep) -> dict[str, Any]:
     return {
         "id": step.id,
@@ -52,7 +60,4 @@ class EventPublisher:
 
 
 async def publish_done(redis: Redis, run_id: str, status: RunStatus) -> None:
-    """The terminal event: tells live subscribers the run is over. Never persisted."""
-    await redis.publish(
-        run_channel(run_id), json.dumps({"step_type": "done", "status": status.value})
-    )
+    await redis.publish(run_channel(run_id), json.dumps(done_event(status)))

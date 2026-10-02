@@ -5,9 +5,11 @@ from typing import Annotated
 import structlog
 from fastapi import Depends, Query
 from fastapi.security import OAuth2PasswordBearer
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import UnauthorizedError
+from app.core.redis import get_redis
 from app.core.security import decode_access_token
 from app.db.session import get_db
 from app.models import User
@@ -23,6 +25,26 @@ async def get_current_user(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User:
     """Authenticate the request from its `Authorization: Bearer` header."""
+    return await _authenticate(token, db)
+
+
+async def get_current_user_sse(
+    token: Annotated[str | None, Depends(_bearer)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    access_token: Annotated[
+        str | None,
+        Query(description="Access token, for EventSource clients that cannot send headers"),
+    ] = None,
+) -> User:
+    """Like `get_current_user`, but also accepts an `access_token` query parameter.
+
+    Only the stream route uses this: query strings end up in logs and browser history.
+    The request log scrubs the parameter.
+    """
+    return await _authenticate(token or access_token, db)
+
+
+async def _authenticate(token: str | None, db: AsyncSession) -> User:
     if not token:
         raise UnauthorizedError()
     user = await db.get(User, decode_access_token(token))
@@ -54,6 +76,8 @@ def get_run_enqueuer() -> RunEnqueuer:
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+StreamUser = Annotated[User, Depends(get_current_user_sse)]
 DbSession = Annotated[AsyncSession, Depends(get_db)]
+RedisClient = Annotated[Redis, Depends(get_redis)]
 PageParams = Annotated[Pagination, Depends(get_pagination)]
 Enqueuer = Annotated[RunEnqueuer, Depends(get_run_enqueuer)]

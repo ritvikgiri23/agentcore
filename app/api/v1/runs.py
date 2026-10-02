@@ -1,14 +1,19 @@
-from typing import Any
+import json
+from collections.abc import AsyncIterator
+from typing import Annotated, Any, NamedTuple
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+from redis.asyncio.client import PubSub
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, DbSession, PageParams
+from app.api.deps import CurrentUser, DbSession, PageParams, RedisClient, StreamUser
 from app.api.v1 import API_V1_PREFIX
 from app.core.errors import ErrorResponse
 from app.models import AgentRun, RunStatus, RunStep
 from app.repositories.ownership import get_owned_run
+from app.runs.stream import run_events, subscribe
 from app.schemas.pagination import Page
 from app.schemas.runs import RunStatusResponse, RunStepResponse
 
@@ -88,3 +93,40 @@ async def list_run_steps(
         limit=paging.limit,
         offset=paging.offset,
     )
+
+
+class _RunSubscription(NamedTuple):
+    run_id: str
+    pubsub: PubSub
+
+
+async def _subscribed_run(
+    run_id: str, user: StreamUser, db: DbSession, redis: RedisClient
+) -> AsyncIterator[_RunSubscription]:
+    # A dependency, not part of the stream body: once streaming starts the 200 is already
+    # sent, so ownership must be settled first. The subscription is closed when the
+    # request ends, whether the run finished or the client went away.
+    run = await get_owned_run(db, user.id, run_id)
+    async with subscribe(redis, run.id) as pubsub:
+        yield _RunSubscription(run.id, pubsub)
+
+
+@router.get(
+    "/{run_id}/stream",
+    response_class=EventSourceResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Stream a run's steps live as Server-Sent Events, ending with a done event",
+    description=(
+        "Replays every persisted step, then relays new ones as they happen, each exactly "
+        "once. The last event is `{\"step_type\": \"done\", \"status\": ...}` with the "
+        "run's terminal status, after which the stream closes. Idle streams receive "
+        "keepalive comments. Accepts the token as a Bearer header or, for EventSource "
+        "clients, an `access_token` query parameter."
+    ),
+    responses=_ERRORS,
+)
+async def stream_run(
+    subscription: Annotated[_RunSubscription, Depends(_subscribed_run)], db: DbSession
+) -> AsyncIterator[ServerSentEvent]:
+    async for event in run_events(db, subscription.pubsub, subscription.run_id):
+        yield ServerSentEvent(raw_data=json.dumps(event))
