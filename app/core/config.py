@@ -26,7 +26,7 @@ class Settings(BaseSettings):
 
     # Auth
     jwt_secret: SecretStr = SecretStr(_DEV_JWT_SECRET)
-    jwt_algorithm: str = "HS256"
+    jwt_algorithm: Literal["HS256", "HS384", "HS512"] = "HS256"
     jwt_expire_minutes: int = Field(default=30, gt=0)
 
     # LLM provider. Falls back to the deterministic fake when no OpenAI key is set.

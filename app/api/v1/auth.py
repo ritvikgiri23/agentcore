@@ -7,12 +7,16 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ConflictError, ErrorResponse, UnauthorizedError
-from app.core.security import create_access_token, hash_password, verify_password
+from app.core.security import create_access_token, hash_password_async, verify_password
 from app.db.session import get_db
 from app.models import User
-from app.schemas.auth import RegisterRequest, TokenResponse
+from app.schemas.auth import PASSWORD_MAX_LENGTH, RegisterRequest, TokenResponse
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def _email_taken() -> ConflictError:
+    return ConflictError("Email already registered", details={"field": "email"})
 
 
 def _token_response(user: User) -> TokenResponse:
@@ -22,6 +26,7 @@ def _token_response(user: User) -> TokenResponse:
 
 @router.post(
     "/register",
+    response_model=TokenResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Register a new user and receive an access token",
     responses={
@@ -33,23 +38,24 @@ async def register(
     body: RegisterRequest, db: Annotated[AsyncSession, Depends(get_db)]
 ) -> TokenResponse:
     email = body.email.lower()
-    conflict = ConflictError("Email already registered", details={"field": "email"})
     if await db.scalar(select(User.id).where(User.email == email)) is not None:
-        raise conflict
+        raise _email_taken()
 
-    user = User(email=email, hashed_password=hash_password(body.password))
+    user = User(email=email, hashed_password=await hash_password_async(body.password))
     db.add(user)
     try:
         await db.commit()
     except IntegrityError:
         # Lost a race with a concurrent registration for the same email.
         await db.rollback()
-        raise conflict from None
+        raise _email_taken() from None
     return _token_response(user)
 
 
 @router.post(
     "/token",
+    response_model=TokenResponse,
+    status_code=status.HTTP_200_OK,
     summary="Log in with email and password (OAuth2 password form)",
     responses={
         401: {"model": ErrorResponse, "description": "Incorrect email or password"},
@@ -60,8 +66,11 @@ async def login(
     form: Annotated[OAuth2PasswordRequestForm, Depends()],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> TokenResponse:
-    user = await db.scalar(select(User).where(User.email == form.username.lower()))
-    if not verify_password(form.password, user.hashed_password if user else None):
+    # No registered password can be this long; reject before doing any hashing work.
+    if len(form.password) > PASSWORD_MAX_LENGTH:
         raise UnauthorizedError("Incorrect email or password")
-    assert user is not None
+    user = await db.scalar(select(User).where(User.email == form.username.lower()))
+    password_ok = await verify_password(form.password, user.hashed_password if user else None)
+    if user is None or not password_ok:
+        raise UnauthorizedError("Incorrect email or password")
     return _token_response(user)

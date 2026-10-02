@@ -19,7 +19,11 @@ def protected_route(app: FastAPI) -> None:
         return {"id": user.id, "email": user.email}
 
 
-def _token(claims: dict[str, object], secret: str | None = None) -> str:
+def _bearer(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _sign_jwt(claims: dict[str, object], secret: str | None = None) -> str:
     settings = get_settings()
     return jwt.encode(
         claims,
@@ -44,7 +48,7 @@ async def test_token_from_register_authenticates(client: AsyncClient) -> None:
     )
     token = registered.json()["access_token"]
 
-    response = await client.get("/api/v1/_whoami", headers={"Authorization": f"Bearer {token}"})
+    response = await client.get("/api/v1/_whoami", headers=_bearer(token))
 
     assert response.status_code == 200
     assert response.json()["email"] == "grace@example.com"
@@ -76,11 +80,11 @@ async def test_expired_token_is_unauthorized(
     client: AsyncClient, authed_user: AuthedUser
 ) -> None:
     issued = datetime.now(UTC) - timedelta(minutes=31)
-    token = _token(
+    token = _sign_jwt(
         {"sub": authed_user.user.id, "type": "access", "iat": issued, "exp": issued + timedelta(minutes=30)}
     )
 
-    response = await client.get("/api/v1/_whoami", headers={"Authorization": f"Bearer {token}"})
+    response = await client.get("/api/v1/_whoami", headers=_bearer(token))
 
     assert response.status_code == 401
     assert response.json()["error"]["message"] == "Access token has expired"
@@ -90,9 +94,9 @@ async def test_token_signed_with_another_secret_is_unauthorized(
     client: AsyncClient, authed_user: AuthedUser
 ) -> None:
     exp = datetime.now(UTC) + timedelta(minutes=30)
-    token = _token({"sub": authed_user.user.id, "type": "access", "exp": exp}, secret="forged")
+    token = _sign_jwt({"sub": authed_user.user.id, "type": "access", "exp": exp}, secret="forged")
 
-    response = await client.get("/api/v1/_whoami", headers={"Authorization": f"Bearer {token}"})
+    response = await client.get("/api/v1/_whoami", headers=_bearer(token))
 
     assert response.status_code == 401
     assert response.json()["error"]["message"] == "Invalid access token"
@@ -100,8 +104,19 @@ async def test_token_signed_with_another_secret_is_unauthorized(
 
 async def test_token_for_unknown_user_is_unauthorized(client: AsyncClient) -> None:
     exp = datetime.now(UTC) + timedelta(minutes=30)
-    token = _token({"sub": "00000000-0000-0000-0000-000000000000", "type": "access", "exp": exp})
+    token = _sign_jwt({"sub": "00000000-0000-0000-0000-000000000000", "type": "access", "exp": exp})
 
-    response = await client.get("/api/v1/_whoami", headers={"Authorization": f"Bearer {token}"})
+    response = await client.get("/api/v1/_whoami", headers=_bearer(token))
 
     assert response.status_code == 401
+
+
+async def test_token_without_expiry_is_unauthorized(
+    client: AsyncClient, authed_user: AuthedUser
+) -> None:
+    token = _sign_jwt({"sub": authed_user.user.id, "type": "access"})
+
+    response = await client.get("/api/v1/_whoami", headers=_bearer(token))
+
+    assert response.status_code == 401
+    assert response.json()["error"]["message"] == "Invalid access token"

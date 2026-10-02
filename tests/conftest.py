@@ -6,8 +6,9 @@ os.environ["LLM_PROVIDER"] = "fake"
 os.environ.pop("OPENAI_API_KEY", None)
 
 import itertools  # noqa: E402
-from collections.abc import AsyncIterator, Awaitable, Callable  # noqa: E402
+from collections.abc import AsyncIterator, Awaitable  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
+from typing import Protocol  # noqa: E402
 
 import pytest  # noqa: E402
 from fakeredis import FakeAsyncRedis  # noqa: E402
@@ -104,14 +105,18 @@ async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
 class AuthedUser:
     user: User
     token: str
-    password: str
 
     @property
     def headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"}
 
 
-UserFactory = Callable[..., Awaitable[AuthedUser]]
+class UserFactory(Protocol):
+    def __call__(self, email: str | None = None) -> Awaitable[AuthedUser]: ...
+
+
+FACTORY_PASSWORD = "password-123"
+_FACTORY_PASSWORD_HASH = hash_password(FACTORY_PASSWORD)
 
 
 @pytest.fixture
@@ -119,14 +124,15 @@ def user_factory(db_session: AsyncSession) -> UserFactory:
     """Create persisted users, each with a valid access token."""
     counter = itertools.count(1)
 
-    async def make(email: str | None = None, password: str = "password-123") -> AuthedUser:
+    async def make(email: str | None = None) -> AuthedUser:
         user = User(
-            email=email or f"user{next(counter)}@example.com",
-            hashed_password=hash_password(password),
+            # Stored lowercased, matching how register and login normalise emails.
+            email=(email or f"user{next(counter)}@example.com").lower(),
+            hashed_password=_FACTORY_PASSWORD_HASH,
         )
         db_session.add(user)
         await db_session.commit()
-        return AuthedUser(user=user, token=create_access_token(user.id).token, password=password)
+        return AuthedUser(user=user, token=create_access_token(user.id).token)
 
     return make
 

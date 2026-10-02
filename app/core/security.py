@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -14,15 +15,22 @@ _pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 _DUMMY_HASH = _pwd_context.hash(uuid.uuid4().hex)
 
 
+# Hashing is deliberately slow (tens of ms); run it off the event loop.
+
+
 def hash_password(password: str) -> str:
     return _pwd_context.hash(password)
 
 
-def verify_password(password: str, hashed_password: str | None) -> bool:
-    if hashed_password is None:
-        _pwd_context.verify(password, _DUMMY_HASH)
-        return False
-    return _pwd_context.verify(password, hashed_password)
+async def hash_password_async(password: str) -> str:
+    return await asyncio.to_thread(hash_password, password)
+
+
+async def verify_password(password: str, hashed_password: str | None) -> bool:
+    """Check a password; with no stored hash, burn equivalent time and return False."""
+    target = hashed_password if hashed_password is not None else _DUMMY_HASH
+    matches = await asyncio.to_thread(_pwd_context.verify, password, target)
+    return matches and hashed_password is not None
 
 
 @dataclass(frozen=True)
@@ -47,7 +55,10 @@ def decode_access_token(token: str) -> str:
     settings = get_settings()
     try:
         claims = jwt.decode(
-            token, settings.jwt_secret.get_secret_value(), algorithms=[settings.jwt_algorithm]
+            token,
+            settings.jwt_secret.get_secret_value(),
+            algorithms=[settings.jwt_algorithm],
+            options={"require_exp": True, "require_sub": True},
         )
     except ExpiredSignatureError:
         raise UnauthorizedError("Access token has expired") from None
