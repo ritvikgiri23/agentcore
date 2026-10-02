@@ -7,7 +7,7 @@ overwritten.
 
 from collections.abc import Collection
 
-from sqlalchemy import func, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import AgentRun, RunStatus
@@ -25,6 +25,11 @@ async def claim(db: AsyncSession, run_id: str) -> AgentRun | None:
     )
     await db.commit()
     return run
+
+
+async def get_status(db: AsyncSession, run_id: str) -> RunStatus | None:
+    """The run's current status, read fresh; None if the run doesn't exist."""
+    return await db.scalar(select(AgentRun.status).where(AgentRun.id == run_id))
 
 
 async def set_tokens_used(db: AsyncSession, run_id: str, tokens_used: int) -> None:

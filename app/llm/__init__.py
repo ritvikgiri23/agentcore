@@ -31,10 +31,15 @@ def create_llm_provider(settings: Settings) -> LLMProvider:
     if settings.llm_provider == "openai":
         # Imported lazily so fake mode never needs the OpenAI client configured.
         from app.llm.openai_provider import OpenAIProvider
+        from app.llm.retry import RetryingLLM
 
         assert settings.openai_api_key is not None
-        return OpenAIProvider(
-            api_key=settings.openai_api_key.get_secret_value(), model=settings.chat_model
+        return RetryingLLM(
+            OpenAIProvider(
+                api_key=settings.openai_api_key.get_secret_value(), model=settings.chat_model
+            ),
+            attempts=settings.llm_retry_attempts,
+            base_delay_seconds=settings.llm_retry_base_delay_seconds,
         )
     return ScriptedLLM(fallback=_FAKE_FALLBACK)
 

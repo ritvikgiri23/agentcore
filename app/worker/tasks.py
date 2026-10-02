@@ -7,16 +7,42 @@ from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
 from app.llm import create_embedder, create_llm_provider
-from app.runs.runner import RunnerDeps, run_agent
+from app.runs.runner import RunInProgress, RunnerDeps, run_agent
 from app.worker.celery_app import celery_app
 
 logger = structlog.get_logger(__name__)
 
 
-@celery_app.task(name="agentcore.execute_agent_run")  # type: ignore[untyped-decorator]
+# Retries anything that escapes the runner: an outage before the claim, or one that kept
+# a claimed run from being finished, which the retry then fails as worker lost.
+RETRY_LIMIT = 5
+RETRY_BACKOFF_MAX_SECONDS = 60
+# Slack past the lease TTL, so the next check finds the lease expired if its holder died.
+LEASE_RECHECK_SLACK_SECONDS = 1
+
+
+@celery_app.task(  # type: ignore[untyped-decorator]
+    name="agentcore.execute_agent_run",
+    autoretry_for=(Exception,),
+    max_retries=RETRY_LIMIT,
+    retry_backoff=True,
+    retry_backoff_max=RETRY_BACKOFF_MAX_SECONDS,
+    retry_jitter=True,
+)
 def execute_agent_run(run_id: str) -> None:
     """Execute one agent run. The task id is the run id."""
-    asyncio.run(_execute(run_id))
+    try:
+        asyncio.run(_execute(run_id))
+    except RunInProgress as exc:
+        # The holder may have just died (its process was killed and this is the requeued
+        # message), so check back rather than drop the run. A live holder keeps its lease
+        # fresh until the run is finished; the check after that is a no-op. A fresh
+        # message rather than a retry, so these checks don't use up the retry budget.
+        execute_agent_run.apply_async(
+            args=[run_id],
+            task_id=run_id,
+            countdown=exc.retry_in + LEASE_RECHECK_SLACK_SECONDS,
+        )
 
 
 async def _execute(run_id: str) -> None:

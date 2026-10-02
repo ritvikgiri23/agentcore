@@ -17,11 +17,13 @@ from app.memory.short_term import Turn
 from app.models import AgentRun, AgentSession, RunStatus, StepType
 from app.runs import lifecycle
 from app.runs.events import EventPublisher, publish_done
+from app.runs.lease import RunLease
 from app.tools import ToolContext, ToolOutcome, dispatch, get_tool_definitions
 
 logger = structlog.get_logger(__name__)
 
 MAX_ITERATIONS_MESSAGE = "Max iterations reached"
+WORKER_LOST_MESSAGE = "worker lost"
 
 _MEMORY_BLOCK_HEADER = (
     "Relevant memories about the user, from earlier conversations. They may be outdated "
@@ -39,29 +41,83 @@ class RunnerDeps:
     embedder: Embedder
 
 
+class RunInProgress(Exception):
+    """Another worker holds the run's lease. Check again once it could have expired."""
+
+    def __init__(self, run_id: str, retry_in: float) -> None:
+        super().__init__(f"Run {run_id} is leased by another worker")
+        self.retry_in = retry_in
+
+
+class _LeaseLost(Exception):
+    """Another worker took the run over while this one stalled; it owns the outcome now."""
+
+
 async def run_agent(run_id: str, deps: RunnerDeps) -> None:
-    """Execute a queued run to completion. Any run not in `queued` is left untouched."""
+    """Execute a queued run to completion, at most once.
+
+    A run another worker holds raises `RunInProgress`. A `running` run whose worker is
+    gone is failed as worker lost, never resumed. Any other run is left untouched.
+    Anything else that escapes is safe to retry: before the claim nothing has happened,
+    and after it a retry finds the run unleased and fails it as worker lost.
+    """
+    lease = RunLease(deps.redis, run_id, get_settings().run_lease_ttl_seconds)
     with structlog.contextvars.bound_contextvars(run_id=run_id):
-        async with deps.session_factory() as db:
-            run = await lifecycle.claim(db, run_id)
-            if run is None:
-                logger.info("run_not_claimed")
-                return
-            agent_session = await db.get(AgentSession, run.session_id)
-            if agent_session is None:
-                # Unreachable while the session FK cascades, but never strand a claimed run.
-                logger.warning("run_session_missing")
-                if await lifecycle.fail(db, run_id):
-                    await publish_done(deps.redis, run_id, RunStatus.FAILED)
-                return
-        structlog.contextvars.bind_contextvars(session_id=agent_session.id)
-        logger.info("run_started")
-        await _AgentLoop(run, agent_session, deps).run()
+        # Taken before the claim, so a duplicate can't mistake a run that was just
+        # claimed, and isn't leased yet, for one whose worker died.
+        if not await lease.acquire():
+            retry_in = await lease.remaining_seconds()
+            logger.info("run_leased_elsewhere", retry_in=retry_in)
+            raise RunInProgress(run_id, retry_in)
+        try:
+            await _claim_and_run(run_id, lease, deps)
+        finally:
+            try:
+                await lease.release()
+            except Exception:
+                # It expires on its own; a lingering lease only delays a redelivery.
+                logger.exception("run_lease_not_released")
+
+
+async def _claim_and_run(run_id: str, lease: RunLease, deps: RunnerDeps) -> None:
+    async with deps.session_factory() as db:
+        run = await lifecycle.claim(db, run_id)
+        if run is None:
+            status = await lifecycle.get_status(db, run_id)
+            if status == RunStatus.RUNNING:
+                # We hold the lease, so whoever claimed this run stopped refreshing it.
+                await _fail_worker_lost(db, run_id, deps)
+            else:
+                logger.info("run_not_claimed", status=status)
+            return
+        agent_session = await db.get(AgentSession, run.session_id)
+        if agent_session is None:
+            # Unreachable while the session FK cascades, but never strand a claimed run.
+            logger.warning("run_session_missing")
+            if await lifecycle.fail(db, run_id):
+                await publish_done(deps.redis, run_id, RunStatus.FAILED)
+            return
+    structlog.contextvars.bind_contextvars(session_id=agent_session.id)
+    logger.info("run_started")
+    await _AgentLoop(run, agent_session, lease, deps).run()
+
+
+async def _fail_worker_lost(db: AsyncSession, run_id: str, deps: RunnerDeps) -> None:
+    logger.warning("run_worker_lost")
+    events = EventPublisher(deps.session_factory, deps.redis)
+    await events.record(
+        run_id, StepType.ERROR, {"type": "WorkerLost", "message": WORKER_LOST_MESSAGE}
+    )
+    if await lifecycle.fail(db, run_id):
+        await events.publish_done(run_id, RunStatus.FAILED)
 
 
 class _AgentLoop:
-    def __init__(self, run: AgentRun, agent_session: AgentSession, deps: RunnerDeps) -> None:
+    def __init__(
+        self, run: AgentRun, agent_session: AgentSession, lease: RunLease, deps: RunnerDeps
+    ) -> None:
         self._settings = get_settings()
+        self._lease = lease
         self._run_id = run.id
         self._session_id = agent_session.id
         self._user_message = run.user_message
@@ -84,6 +140,8 @@ class _AgentLoop:
     async def run(self) -> None:
         try:
             await self._loop()
+        except _LeaseLost:
+            logger.warning("run_lease_lost")
         except Exception as exc:
             if self._completed:
                 # Only the `done` publish can fail now; the run's outcome is already settled.
@@ -104,6 +162,7 @@ class _AgentLoop:
 
         max_iterations = self._settings.max_iterations
         for iteration in range(1, max_iterations + 1):
+            await self._keep_lease()
             result = await self._call_llm(iteration)
             if not result.tool_calls:
                 await self._finish(result.content or "", iterations=iteration)
@@ -111,6 +170,17 @@ class _AgentLoop:
             self._messages.append(result.as_assistant_message())
             await self._call_tools(iteration, result.tool_calls)
         await self._finish(MAX_ITERATIONS_MESSAGE, iterations=max_iterations, cap_hit=True)
+
+    async def _keep_lease(self) -> None:
+        if await self._lease.refresh():
+            return
+        # The lease lapsed while this worker stalled. Carry on unless someone took over:
+        # a redelivery holds the lease now, or already failed the run as worker lost.
+        async with self._deps.session_factory() as db:
+            status = await lifecycle.get_status(db, self._run_id)
+        if status != RunStatus.RUNNING or not await self._lease.acquire():
+            raise _LeaseLost
+        logger.info("run_lease_retaken")
 
     async def _retrieve_memories(self) -> tuple[list[RecalledMemory], list[Turn]]:
         turns = await short_term.recent_turns(

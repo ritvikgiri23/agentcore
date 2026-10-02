@@ -128,10 +128,8 @@ async def test_stops_at_the_iteration_cap(
     assert finished.tokens_used == 15 * cap
 
 
-@pytest.mark.parametrize(
-    "status", [RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED, RunStatus.RUNNING]
-)
-async def test_run_not_in_queued_state_is_a_no_op(
+@pytest.mark.parametrize("status", [RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED])
+async def test_terminal_run_is_a_no_op(
     authed_user: AuthedUser,
     agent_session_factory: AgentSessionFactory,
     agent_run_factory: AgentRunFactory,

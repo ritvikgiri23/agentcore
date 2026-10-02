@@ -20,5 +20,11 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     worker_pool="prefork",
+    # Ack only once a run is done, and requeue if the worker process dies mid-run: the
+    # runner's lease and atomic claim make a redelivery harmless.
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    # Runs are long; don't let one worker hoard queued runs it hasn't started.
+    worker_prefetch_multiplier=1,
     worker_hijack_root_logger=False,
 )

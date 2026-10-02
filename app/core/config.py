@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     chat_model: str = "gpt-4o-mini"
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
+    # On top of the SDK's own retries: attempts per chat call for 429s, 5xx and timeouts.
+    llm_retry_attempts: int = Field(default=3, gt=0)
+    llm_retry_base_delay_seconds: float = Field(default=0.5, ge=0)
 
     # Agent loop tunables
     max_iterations: int = Field(default=10, gt=0)
