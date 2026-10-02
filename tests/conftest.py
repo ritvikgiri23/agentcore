@@ -5,7 +5,9 @@ os.environ["ENVIRONMENT"] = "test"
 os.environ["LLM_PROVIDER"] = "fake"
 os.environ.pop("OPENAI_API_KEY", None)
 
-from collections.abc import AsyncIterator  # noqa: E402
+import itertools  # noqa: E402
+from collections.abc import AsyncIterator, Awaitable, Callable  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
 
 import pytest  # noqa: E402
 from fakeredis import FakeAsyncRedis  # noqa: E402
@@ -22,9 +24,11 @@ from sqlalchemy.pool import NullPool  # noqa: E402
 
 from app.core.config import get_settings  # noqa: E402
 from app.core.redis import get_redis  # noqa: E402
+from app.core.security import create_access_token, hash_password  # noqa: E402
 from app.db.base import Base  # noqa: E402
 from app.db.session import get_db  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.models import User  # noqa: E402  (importing app.models registers every table)
 
 
 @pytest.fixture(scope="session")
@@ -94,3 +98,39 @@ async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
+
+
+@dataclass(frozen=True)
+class AuthedUser:
+    user: User
+    token: str
+    password: str
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}"}
+
+
+UserFactory = Callable[..., Awaitable[AuthedUser]]
+
+
+@pytest.fixture
+def user_factory(db_session: AsyncSession) -> UserFactory:
+    """Create persisted users, each with a valid access token."""
+    counter = itertools.count(1)
+
+    async def make(email: str | None = None, password: str = "password-123") -> AuthedUser:
+        user = User(
+            email=email or f"user{next(counter)}@example.com",
+            hashed_password=hash_password(password),
+        )
+        db_session.add(user)
+        await db_session.commit()
+        return AuthedUser(user=user, token=create_access_token(user.id).token, password=password)
+
+    return make
+
+
+@pytest.fixture
+async def authed_user(user_factory: UserFactory) -> AuthedUser:
+    return await user_factory()

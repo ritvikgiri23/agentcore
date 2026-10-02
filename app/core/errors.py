@@ -34,6 +34,7 @@ class AppError(Exception):
     status_code: int = 400
     code: str = "bad_request"
     message: str = "Bad request"
+    headers: Mapping[str, str] | None = None
 
     def __init__(self, message: str | None = None, *, details: Any = None) -> None:
         self.message = message or self.message
@@ -57,6 +58,7 @@ class UnauthorizedError(AppError):
     status_code = 401
     code = "unauthorized"
     message = "Not authenticated"
+    headers = {"WWW-Authenticate": "Bearer"}
 
 
 class RateLimitedError(AppError):
@@ -121,6 +123,7 @@ def _render_app_error(request: Request, exc: AppError) -> JSONResponse:
         code=exc.code,
         message=exc.message,
         details=exc.details,
+        headers=exc.headers,
     )
 
 

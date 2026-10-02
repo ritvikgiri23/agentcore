@@ -17,7 +17,7 @@ logs: ## Tail API and worker logs
 
 test: ## Run the test suite in a container against the compose Postgres
 	$(COMPOSE_DEV) up -d --wait postgres
-	$(COMPOSE_DEV) run --rm --no-deps api pytest $(ARGS)
+	$(COMPOSE_DEV) run --rm --build --no-deps api pytest $(ARGS)
 
 migrate: ## Apply database migrations
 	$(COMPOSE) run --rm migrate

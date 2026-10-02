@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from alembic import context
 from app.core.config import get_settings
+import app.models  # noqa: F401  (registers every table for autogenerate)
 from app.db.base import Base
 
 config = context.config
