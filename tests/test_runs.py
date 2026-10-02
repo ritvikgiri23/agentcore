@@ -170,7 +170,7 @@ async def test_status_before_and_after_execution(
     assert after["status"] == "completed"
     # Two scripted LLM calls at 15 tokens each.
     assert after["tokens_used"] == 30
-    assert after["step_count"] == 5
+    assert after["step_count"] == 6
     assert after["final_answer"] == "15% of 3,655,000 is 548,250."
     assert after["created_at"] <= after["started_at"] <= after["finished_at"]
 
@@ -189,9 +189,10 @@ async def test_step_trace(
 
     assert response.status_code == 200
     page = response.json()
-    assert page["total"] == 5
+    assert page["total"] == 6
     steps = page["items"]
     assert [s["step_type"] for s in steps] == [
+        "memory_retrieval",
         "llm_call",
         "tool_call",
         "tool_result",
@@ -199,7 +200,10 @@ async def test_step_trace(
         "final_answer",
     ]
     assert all(s["id"] and s["occurred_at"] for s in steps)
-    first_llm, tool_call, tool_result, second_llm, final = (s["payload"] for s in steps)
+    retrieval, first_llm, tool_call, tool_result, second_llm, final = (
+        s["payload"] for s in steps
+    )
+    assert retrieval == {"memories": []}
     call_id = first_llm["tool_calls"][0]["id"]
     assert first_llm == {
         "iteration": 1,
@@ -253,8 +257,8 @@ async def test_steps_are_paginated_in_occurrence_order(
     )
 
     page = response.json()
-    assert (page["total"], page["limit"], page["offset"]) == (5, 2, 2)
-    assert [s["step_type"] for s in page["items"]] == ["tool_result", "llm_call"]
+    assert (page["total"], page["limit"], page["offset"]) == (6, 2, 2)
+    assert [s["step_type"] for s in page["items"]] == ["tool_call", "tool_result"]
 
 
 async def test_session_detail_lists_five_most_recent_runs(

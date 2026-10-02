@@ -9,7 +9,9 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import get_settings
-from app.llm import ChatMessage, ChatResult, LLMProvider, ToolCallRequest
+from app.llm import ChatMessage, ChatResult, Embedder, LLMProvider, ToolCallRequest
+from app.memory import long_term
+from app.memory.long_term import RecalledMemory
 from app.models import AgentRun, AgentSession, RunStatus, StepType
 from app.runs import lifecycle
 from app.runs.events import EventPublisher, publish_done
@@ -19,6 +21,11 @@ logger = structlog.get_logger(__name__)
 
 MAX_ITERATIONS_MESSAGE = "Max iterations reached"
 
+_MEMORY_BLOCK_HEADER = (
+    "Relevant memories about the user, from earlier conversations. They may be outdated "
+    "or no longer true; prefer what the user says now."
+)
+
 
 @dataclass(frozen=True)
 class RunnerDeps:
@@ -27,6 +34,7 @@ class RunnerDeps:
     session_factory: async_sessionmaker[AsyncSession]
     redis: Redis
     llm: LLMProvider
+    embedder: Embedder
 
 
 async def run_agent(run_id: str, deps: RunnerDeps) -> None:
@@ -53,6 +61,9 @@ class _AgentLoop:
     def __init__(self, run: AgentRun, agent_session: AgentSession, deps: RunnerDeps) -> None:
         self._settings = get_settings()
         self._run_id = run.id
+        self._user_message = run.user_message
+        self._user_id = agent_session.user_id
+        self._system_prompt = agent_session.system_prompt
         self._deps = deps
         self._events = EventPublisher(deps.session_factory, deps.redis)
         self._enabled_tools = list(agent_session.tools_enabled)
@@ -62,12 +73,10 @@ class _AgentLoop:
             run_id=run.id,
             session_factory=deps.session_factory,
             llm=deps.llm,
+            embedder=deps.embedder,
         )
         self._messages: list[ChatMessage] = []
         self._completed = False
-        if agent_session.system_prompt:
-            self._messages.append({"role": "system", "content": agent_session.system_prompt})
-        self._messages.append({"role": "user", "content": run.user_message})
 
     async def run(self) -> None:
         try:
@@ -80,6 +89,14 @@ class _AgentLoop:
             await self._fail(exc)
 
     async def _loop(self) -> None:
+        memories = await self._retrieve_memories()
+        system = "\n\n".join(
+            part for part in (self._system_prompt, _memory_block(memories)) if part
+        )
+        if system:
+            self._messages.append({"role": "system", "content": system})
+        self._messages.append({"role": "user", "content": self._user_message})
+
         max_iterations = self._settings.max_iterations
         for iteration in range(1, max_iterations + 1):
             result = await self._call_llm(iteration)
@@ -89,6 +106,44 @@ class _AgentLoop:
             self._messages.append(result.as_assistant_message())
             await self._call_tools(iteration, result.tool_calls)
         await self._finish(MAX_ITERATIONS_MESSAGE, iterations=max_iterations, cap_hit=True)
+
+    async def _retrieve_memories(self) -> list[RecalledMemory]:
+        memories: list[RecalledMemory] = []
+        top_k = self._settings.long_term_top_k
+        with structlog.contextvars.bound_contextvars(
+            step_type=StepType.MEMORY_RETRIEVAL.value
+        ):
+            embedding: list[float] | None = None
+            if top_k > 0:
+                try:
+                    embedding = await self._deps.embedder.embed(self._user_message)
+                except Exception:
+                    # Memories only add context; an embedding outage must not block answering.
+                    logger.exception("memory_embedding_failed")
+            if embedding is not None:
+                async with self._deps.session_factory() as db:
+                    memories = await long_term.search(
+                        db,
+                        self._user_id,
+                        embedding,
+                        limit=top_k,
+                        max_distance=self._settings.memory_max_distance,
+                    )
+        await self._events.record(
+            self._run_id,
+            StepType.MEMORY_RETRIEVAL,
+            {
+                "memories": [
+                    {
+                        "id": m.memory.id,
+                        "content": m.memory.content,
+                        "distance": round(m.distance, 6),
+                    }
+                    for m in memories
+                ],
+            },
+        )
+        return memories
 
     async def _call_llm(self, iteration: int) -> ChatResult:
         with structlog.contextvars.bound_contextvars(step_type=StepType.LLM_CALL.value):
@@ -213,3 +268,11 @@ class _AgentLoop:
             logger.info("run_failure_skipped")
             return
         await self._events.publish_done(self._run_id, RunStatus.FAILED)
+
+
+def _memory_block(memories: list[RecalledMemory]) -> str:
+    """The delimited memories section of the system message; empty when there are none."""
+    if not memories:
+        return ""
+    lines = "\n".join(f"- {m.memory.content}" for m in memories)
+    return f"<relevant_memories>\n{_MEMORY_BLOCK_HEADER}\n{lines}\n</relevant_memories>"

@@ -2,20 +2,23 @@ from app.core.config import Settings
 from app.llm.base import (
     ChatMessage,
     ChatResult,
+    Embedder,
     LLMProvider,
     LLMUsage,
     ToolCallRequest,
     ToolDefinition,
 )
-from app.llm.fake import FakeReply, ScriptedLLM
+from app.llm.fake import FakeReply, HashEmbedder, ScriptedLLM
 
 __all__ = [
     "ChatMessage",
     "ChatResult",
+    "Embedder",
     "LLMProvider",
     "LLMUsage",
     "ToolCallRequest",
     "ToolDefinition",
+    "create_embedder",
     "create_llm_provider",
 ]
 
@@ -34,3 +37,17 @@ def create_llm_provider(settings: Settings) -> LLMProvider:
             api_key=settings.openai_api_key.get_secret_value(), model=settings.chat_model
         )
     return ScriptedLLM(fallback=_FAKE_FALLBACK)
+
+
+def create_embedder(settings: Settings) -> Embedder:
+    """The embedder selected by settings. Callers own it and must `aclose()` it."""
+    if settings.llm_provider == "openai":
+        from app.llm.openai_provider import OpenAIEmbedder
+
+        assert settings.openai_api_key is not None
+        return OpenAIEmbedder(
+            api_key=settings.openai_api_key.get_secret_value(),
+            model=settings.embedding_model,
+            dimensions=settings.embedding_dimensions,
+        )
+    return HashEmbedder(settings.embedding_dimensions)

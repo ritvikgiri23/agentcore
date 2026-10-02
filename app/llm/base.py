@@ -5,6 +5,9 @@ from typing import Any, Protocol
 type ChatMessage = dict[str, Any]
 type ToolDefinition = dict[str, Any]
 
+# text-embedding-3-small's size; the fake embedder and the memory table match it.
+EMBEDDING_DIMENSIONS = 1536
+
 
 @dataclass(frozen=True)
 class ToolCallRequest:
@@ -55,6 +58,14 @@ class LLMProvider(Protocol):
         self, messages: list[ChatMessage], tools: list[ToolDefinition]
     ) -> ChatResult:
         """One chat completion; with tools, the model chooses whether to call them."""
+        ...
+
+    async def aclose(self) -> None: ...
+
+
+class Embedder(Protocol):
+    async def embed(self, text: str) -> list[float]:
+        """One embedding vector for the text."""
         ...
 
     async def aclose(self) -> None: ...

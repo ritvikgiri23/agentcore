@@ -1,13 +1,24 @@
 import copy
+import hashlib
 import itertools
 import json
+import math
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.llm.base import ChatMessage, ChatResult, LLMUsage, ToolCallRequest, ToolDefinition
+from app.llm.base import (
+    EMBEDDING_DIMENSIONS,
+    ChatMessage,
+    ChatResult,
+    LLMUsage,
+    ToolCallRequest,
+    ToolDefinition,
+)
 
 FAKE_MODEL = "fake-llm"
+_WORD = re.compile(r"\w+")
 
 
 @dataclass(frozen=True)
@@ -73,6 +84,32 @@ class ScriptedLLM:
             finish_reason="tool_calls" if tool_calls else "stop",
             usage=reply.usage,
         )
+
+    async def aclose(self) -> None:
+        return None
+
+
+class HashEmbedder:
+    """A deterministic bag-of-words embedder: no model, no network.
+
+    Each word is hashed into one dimension, so identical text maps to identical vectors
+    and texts sharing more words are closer — enough for reproducible similarity ranking.
+    Texts with no words in common are orthogonal (cosine distance 1), barring collisions.
+    """
+
+    def __init__(self, dimensions: int = EMBEDDING_DIMENSIONS) -> None:
+        self._dimensions = dimensions
+
+    async def embed(self, text: str) -> list[float]:
+        # Text with no words still needs a nonzero vector: cosine distance to zero is undefined.
+        tokens = _WORD.findall(text.lower()) or [text]
+        vector = [0.0] * self._dimensions
+        for token in tokens:
+            # sha256, not hash(): Python's string hash is salted per process.
+            digest = hashlib.sha256(token.encode()).digest()
+            vector[int.from_bytes(digest[:8], "big") % self._dimensions] += 1.0
+        norm = math.sqrt(sum(x * x for x in vector))
+        return [x / norm for x in vector]
 
     async def aclose(self) -> None:
         return None

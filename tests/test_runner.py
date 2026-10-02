@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import get_settings
 from app.llm import LLMUsage
-from app.llm.fake import FakeReply, ScriptedLLM, answer, call_tool
+from app.llm.fake import FakeReply, HashEmbedder, ScriptedLLM, answer, call_tool
 from app.models import AgentRun, RunStatus, RunStep
 from app.runs.events import run_channel
 from app.runs.runner import RunnerDeps, run_agent
@@ -52,7 +52,11 @@ async def test_plain_answer_stops_after_one_llm_call(
 
     await execute_run(run.id, llm)
 
-    assert [s.step_type for s in await _steps(db_session, run.id)] == ["llm_call", "final_answer"]
+    assert [s.step_type for s in await _steps(db_session, run.id)] == [
+        "memory_retrieval",
+        "llm_call",
+        "final_answer",
+    ]
     finished = await _run(db_session, run.id)
     assert finished.status == RunStatus.COMPLETED
     assert finished.final_answer == "Hi."
@@ -108,9 +112,11 @@ async def test_stops_at_the_iteration_cap(
     assert cap == 10
     assert len(llm.requests) == cap
     steps = await _steps(db_session, run.id)
-    assert [s.step_type for s in steps] == ["llm_call", "tool_call", "tool_result"] * cap + [
-        "final_answer"
-    ]
+    assert [s.step_type for s in steps] == ["memory_retrieval"] + [
+        "llm_call",
+        "tool_call",
+        "tool_result",
+    ] * cap + ["final_answer"]
     assert steps[-1].payload == {
         "content": "Max iterations reached",
         "iterations": cap,
@@ -164,7 +170,7 @@ async def test_second_invocation_on_completed_run_is_a_no_op(
     await execute_run(run.id, second_llm)
 
     assert second_llm.requests == []
-    assert len(await _steps(db_session, run.id)) == 2
+    assert len(await _steps(db_session, run.id)) == 3
     finished = await _run(db_session, run.id)
     assert finished.final_answer == "first"
     assert finished.finished_at == first_finish
@@ -242,7 +248,7 @@ async def test_every_published_event_is_already_persisted(
     llm = ScriptedLLM([call_tool("calculator", {"expression": "6 * 7"}), answer("42")])
 
     try:
-        await run_agent(run.id, RunnerDeps(worker_session_factory, redis, llm))
+        await run_agent(run.id, RunnerDeps(worker_session_factory, redis, llm, HashEmbedder()))
     finally:
         await redis.aclose()
 
@@ -337,13 +343,14 @@ async def test_bad_tool_calls_become_error_results_and_the_loop_continues(
 
     steps = await _steps(db_session, run.id)
     assert [s.step_type for s in steps] == [
+        "memory_retrieval",
         "llm_call",
         "tool_call",
         "tool_result",
         "llm_call",
         "final_answer",
     ]
-    result = steps[2].payload
+    result = steps[3].payload
     assert result["tool_call_id"] == "call_1"
     assert result["name"] == name
     assert result["is_error"] is True
@@ -437,13 +444,14 @@ async def test_tool_timeout_records_a_timeout_step_and_the_loop_continues(
 
     steps = await _steps(db_session, run.id)
     assert [s.step_type for s in steps] == [
+        "memory_retrieval",
         "llm_call",
         "tool_call",
         "tool_timeout",
         "llm_call",
         "final_answer",
     ]
-    assert steps[2].payload == {
+    assert steps[3].payload == {
         "tool_call_id": "call_1",
         "name": "dawdle",
         "timeout_seconds": 0.05,
@@ -503,6 +511,7 @@ async def test_parallel_tool_calls_run_concurrently_and_keep_their_order(
     assert finished_order == ["fast", "slow"]
     steps = await _steps(db_session, run.id)
     assert [s.step_type for s in steps] == [
+        "memory_retrieval",
         "llm_call",
         "tool_call",
         "tool_call",
@@ -513,8 +522,8 @@ async def test_parallel_tool_calls_run_concurrently_and_keep_their_order(
         "llm_call",
         "final_answer",
     ]
-    assert [s.payload["tool_call_id"] for s in steps[1:7]] == ["call_1", "call_2", "call_3"] * 2
-    assert [s.payload["is_error"] for s in steps[4:7]] == [False, False, True]
+    assert [s.payload["tool_call_id"] for s in steps[2:8]] == ["call_1", "call_2", "call_3"] * 2
+    assert [s.payload["is_error"] for s in steps[5:8]] == [False, False, True]
     assert await _tool_messages(llm, 1) == [
         {"role": "tool", "tool_call_id": "call_1", "content": "slow:a"},
         {"role": "tool", "tool_call_id": "call_2", "content": "fast:b"},
@@ -543,7 +552,13 @@ async def test_unhandled_exception_fails_the_run_with_an_error_step(
     await execute_run(run.id, llm)
 
     steps = await _steps(db_session, run.id)
-    assert [s.step_type for s in steps] == ["llm_call", "tool_call", "tool_result", "error"]
+    assert [s.step_type for s in steps] == [
+        "memory_retrieval",
+        "llm_call",
+        "tool_call",
+        "tool_result",
+        "error",
+    ]
     assert steps[-1].payload == {
         "type": "RuntimeError",
         "message": "ScriptedLLM script exhausted after 1 calls",
@@ -619,10 +634,16 @@ async def test_failure_after_completion_does_not_add_an_error_step(
 
     try:
         await run_agent(
-            run.id, RunnerDeps(worker_session_factory, redis, ScriptedLLM([answer("Hi.")]))
+            run.id, RunnerDeps(
+                worker_session_factory, redis, ScriptedLLM([answer("Hi.")]), HashEmbedder()
+            )
         )
     finally:
         await redis.aclose()
 
-    assert [s.step_type for s in await _steps(db_session, run.id)] == ["llm_call", "final_answer"]
+    assert [s.step_type for s in await _steps(db_session, run.id)] == [
+        "memory_retrieval",
+        "llm_call",
+        "final_answer",
+    ]
     assert (await _run(db_session, run.id)).status == RunStatus.COMPLETED

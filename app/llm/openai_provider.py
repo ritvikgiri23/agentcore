@@ -56,3 +56,19 @@ def normalise_completion(completion: ChatCompletion, *, latency_ms: float) -> Ch
         ),
         latency_ms=latency_ms,
     )
+
+
+class OpenAIEmbedder:
+    def __init__(self, *, api_key: str, model: str, dimensions: int) -> None:
+        self._client = AsyncOpenAI(api_key=api_key)
+        self._model = model
+        self._dimensions = dimensions
+
+    async def embed(self, text: str) -> list[float]:
+        response = await self._client.embeddings.create(
+            model=self._model, input=text, dimensions=self._dimensions
+        )
+        return response.data[0].embedding
+
+    async def aclose(self) -> None:
+        await self._client.close()

@@ -6,7 +6,7 @@ from typing import Any, get_type_hints
 from pydantic import BaseModel, ConfigDict, create_model
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.llm.base import LLMProvider, LLMUsage
+from app.llm.base import Embedder, LLMProvider, LLMUsage
 
 
 @dataclass
@@ -33,6 +33,7 @@ class ToolContext:
     run_id: str
     session_factory: async_sessionmaker[AsyncSession] | None = None
     llm: LLMProvider | None = None
+    embedder: Embedder | None = None
     usage: TokenUsage = field(default_factory=TokenUsage)
 
 

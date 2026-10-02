@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import NotFoundError
-from app.models import AgentRun, AgentSession
+from app.models import AgentRun, AgentSession, LongTermMemory
 
 
 def _canonical_id(resource_id: str) -> str | None:
@@ -51,3 +51,18 @@ async def get_owned_run(db: AsyncSession, user_id: str, run_id: str) -> AgentRun
         raise NotFoundError("Run not found")
     structlog.contextvars.bind_contextvars(run_id=run.id, session_id=run.session_id)
     return run
+
+
+async def get_owned_memory(db: AsyncSession, user_id: str, memory_id: str) -> LongTermMemory:
+    canonical_id = _canonical_id(memory_id)
+    memory = None
+    if canonical_id is not None:
+        memory = await db.scalar(
+            select(LongTermMemory).where(
+                LongTermMemory.id == canonical_id, LongTermMemory.user_id == user_id
+            )
+        )
+    if memory is None:
+        raise NotFoundError("Memory not found")
+    structlog.contextvars.bind_contextvars(memory_id=memory.id)
+    return memory

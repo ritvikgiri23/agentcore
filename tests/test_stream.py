@@ -87,6 +87,7 @@ async def test_finished_run_replays_every_step_then_done(
     assert response.headers["content-type"].startswith("text/event-stream")
     persisted = await _persisted_events(db_session, run.id)
     assert [e["step_type"] for e in persisted] == [
+        "memory_retrieval",
         "llm_call",
         "tool_call",
         "tool_result",
@@ -127,7 +128,7 @@ async def test_failed_run_ends_with_done_failed(
     response = await client.get(_stream_url(run.id), headers=authed_user.headers)
 
     frames = _frames(response.text)
-    assert [f["step_type"] for f in frames] == ["error", "done"]
+    assert [f["step_type"] for f in frames] == ["memory_retrieval", "error", "done"]
     assert frames[-1] == {"step_type": "done", "status": "failed"}
 
 

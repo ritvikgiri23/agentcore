@@ -32,8 +32,16 @@ from app.db.base import Base  # noqa: E402
 from app.db.session import get_db  # noqa: E402
 from app.main import create_app  # noqa: E402
 # Importing app.models registers every table.
-from app.llm import LLMProvider  # noqa: E402
-from app.models import AgentRun, AgentSession, RunStatus, RunStep, User  # noqa: E402
+from app.llm import Embedder, LLMProvider  # noqa: E402
+from app.llm.fake import HashEmbedder  # noqa: E402
+from app.models import (  # noqa: E402
+    AgentRun,
+    AgentSession,
+    LongTermMemory,
+    RunStatus,
+    RunStep,
+    User,
+)
 from app.runs.runner import RunnerDeps, run_agent  # noqa: E402
 from app.tools import TOOL_REGISTRY, ToolContext  # noqa: E402
 
@@ -241,7 +249,9 @@ def worker_session_factory(db_connection: AsyncConnection) -> async_sessionmaker
 
 
 class RunExecutor(Protocol):
-    def __call__(self, run_id: str, llm: LLMProvider) -> Awaitable[None]: ...
+    def __call__(
+        self, run_id: str, llm: LLMProvider, embedder: Embedder | None = None
+    ) -> Awaitable[None]: ...
 
 
 @pytest.fixture
@@ -252,9 +262,15 @@ def execute_run(
 ) -> RunExecutor:
     """Execute a run in-process through the entry point the Celery task uses."""
 
-    async def execute(run_id: str, llm: LLMProvider) -> None:
+    async def execute(run_id: str, llm: LLMProvider, embedder: Embedder | None = None) -> None:
         await run_agent(
-            run_id, RunnerDeps(session_factory=worker_session_factory, redis=redis, llm=llm)
+            run_id,
+            RunnerDeps(
+                session_factory=worker_session_factory,
+                redis=redis,
+                llm=llm,
+                embedder=embedder or HashEmbedder(),
+            ),
         )
         # The worker wrote through its own sessions, so cached runs and steps are stale.
         # Expunged rather than expired: tests keep reading attributes of objects they hold.
@@ -263,3 +279,40 @@ def execute_run(
                 db_session.expunge(obj)
 
     return execute
+
+
+class FailingEmbedder:
+    """An embedder whose service is down."""
+
+    async def embed(self, text: str) -> list[float]:
+        raise RuntimeError("embedding service down")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class MemoryFactory(Protocol):
+    def __call__(
+        self, owner: AuthedUser, content: str, source_run_id: str | None = None
+    ) -> Awaitable[LongTermMemory]: ...
+
+
+@pytest.fixture
+def memory_factory(db_session: AsyncSession) -> MemoryFactory:
+    """Create persisted long-term memories, embedded with the fake embedder."""
+    embedder = HashEmbedder()
+
+    async def make(
+        owner: AuthedUser, content: str, source_run_id: str | None = None
+    ) -> LongTermMemory:
+        memory = LongTermMemory(
+            user_id=owner.user.id,
+            content=content,
+            embedding=await embedder.embed(content),
+            source_run_id=source_run_id,
+        )
+        db_session.add(memory)
+        await db_session.commit()
+        return memory
+
+    return make

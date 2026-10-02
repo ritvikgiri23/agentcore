@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Annotated
 
 import structlog
@@ -8,10 +9,12 @@ from fastapi.security import OAuth2PasswordBearer
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.errors import UnauthorizedError
 from app.core.redis import get_redis
 from app.core.security import decode_access_token
 from app.db.session import get_db
+from app.llm import Embedder, create_embedder
 from app.models import User
 from app.schemas.pagination import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, MAX_PAGE_OFFSET
 from app.worker.tasks import enqueue_run
@@ -75,9 +78,16 @@ def get_run_enqueuer() -> RunEnqueuer:
     return enqueue_run
 
 
+@lru_cache
+def get_embedder() -> Embedder:
+    """The shared embedder for API requests. Overridable in tests."""
+    return create_embedder(get_settings())
+
+
 CurrentUser = Annotated[User, Depends(get_current_user)]
 StreamUser = Annotated[User, Depends(get_current_user_sse)]
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 RedisClient = Annotated[Redis, Depends(get_redis)]
 PageParams = Annotated[Pagination, Depends(get_pagination)]
 Enqueuer = Annotated[RunEnqueuer, Depends(get_run_enqueuer)]
+EmbedderDep = Annotated[Embedder, Depends(get_embedder)]
