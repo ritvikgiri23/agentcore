@@ -16,8 +16,9 @@ from app.core.security import decode_access_token
 from app.db.session import get_db
 from app.llm import Embedder, create_embedder
 from app.models import User
+from app.runs.cancellation import RunRevoker
 from app.schemas.pagination import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, MAX_PAGE_OFFSET
-from app.worker.tasks import enqueue_run
+from app.worker.tasks import enqueue_run, revoke_run
 
 # auto_error=False so a missing token is rendered by our own 401 envelope.
 _bearer = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token", auto_error=False)
@@ -78,6 +79,11 @@ def get_run_enqueuer() -> RunEnqueuer:
     return enqueue_run
 
 
+def get_run_revoker() -> RunRevoker:
+    """Revokes a run's worker task. Overridden in tests, which never run a broker."""
+    return revoke_run
+
+
 @lru_cache
 def get_embedder() -> Embedder:
     """The shared embedder for API requests. Overridable in tests."""
@@ -90,4 +96,5 @@ DbSession = Annotated[AsyncSession, Depends(get_db)]
 RedisClient = Annotated[Redis, Depends(get_redis)]
 PageParams = Annotated[Pagination, Depends(get_pagination)]
 Enqueuer = Annotated[RunEnqueuer, Depends(get_run_enqueuer)]
+Revoker = Annotated[RunRevoker, Depends(get_run_revoker)]
 EmbedderDep = Annotated[Embedder, Depends(get_embedder)]

@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import (  # noqa: E402
 )
 from sqlalchemy.pool import NullPool  # noqa: E402
 
-from app.api.deps import get_run_enqueuer  # noqa: E402
+from app.api.deps import get_run_enqueuer, get_run_revoker  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 from app.core.redis import get_redis  # noqa: E402
 from app.core.security import create_access_token, hash_password  # noqa: E402
@@ -99,7 +99,15 @@ def enqueued() -> list[str]:
 
 
 @pytest.fixture
-def app(db_session: AsyncSession, redis: FakeAsyncRedis, enqueued: list[str]) -> FastAPI:
+def revoked() -> list[str]:
+    """Run ids whose worker task the API revoked."""
+    return []
+
+
+@pytest.fixture
+def app(
+    db_session: AsyncSession, redis: FakeAsyncRedis, enqueued: list[str], revoked: list[str]
+) -> FastAPI:
     app = create_app()
 
     async def _get_db() -> AsyncIterator[AsyncSession]:
@@ -111,6 +119,7 @@ def app(db_session: AsyncSession, redis: FakeAsyncRedis, enqueued: list[str]) ->
     app.dependency_overrides[get_db] = _get_db
     app.dependency_overrides[get_redis] = _get_redis
     app.dependency_overrides[get_run_enqueuer] = lambda: enqueued.append
+    app.dependency_overrides[get_run_revoker] = lambda: revoked.append
     return app
 
 

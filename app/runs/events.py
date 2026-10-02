@@ -45,18 +45,29 @@ class EventPublisher:
 
     async def record(self, run_id: str, step_type: StepType, payload: dict[str, Any]) -> RunStep:
         async with self._session_factory() as db:
-            step = RunStep(run_id=run_id, step_type=step_type.value, payload=payload)
-            db.add(step)
-            await db.commit()
-            # Loads the server-generated occurrence time.
-            await db.refresh(step)
-        with structlog.contextvars.bound_contextvars(step_type=step_type.value):
-            logger.info("run_step_recorded", step_id=step.id)
-        await self._redis.publish(run_channel(run_id), json.dumps(step_event(step)))
-        return step
+            return await record_step(db, self._redis, run_id, step_type, payload)
 
     async def publish_done(self, run_id: str, status: RunStatus) -> None:
         await publish_done(self._redis, run_id, status)
+
+
+async def record_step(
+    db: AsyncSession,
+    redis: Redis,
+    run_id: str,
+    step_type: StepType,
+    payload: dict[str, Any],
+) -> RunStep:
+    """Persist a step on `db`, then publish it."""
+    step = RunStep(run_id=run_id, step_type=step_type.value, payload=payload)
+    db.add(step)
+    await db.commit()
+    # Loads the server-generated occurrence time.
+    await db.refresh(step)
+    with structlog.contextvars.bound_contextvars(step_type=step_type.value):
+        logger.info("run_step_recorded", step_id=step.id)
+    await redis.publish(run_channel(run_id), json.dumps(step_event(step)))
+    return step
 
 
 async def publish_done(redis: Redis, run_id: str, status: RunStatus) -> None:

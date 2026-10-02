@@ -32,6 +32,7 @@ class RunStatus(enum.StrEnum):
     CANCELLED = "cancelled"
 
 
+ACTIVE_STATUSES = frozenset({RunStatus.QUEUED, RunStatus.RUNNING})
 TERMINAL_STATUSES = frozenset({RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED})
 
 

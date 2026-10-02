@@ -15,7 +15,7 @@ from app.memory import long_term, short_term
 from app.memory.long_term import RecalledMemory
 from app.memory.short_term import Turn
 from app.models import AgentRun, AgentSession, RunStatus, StepType
-from app.runs import lifecycle
+from app.runs import cancellation, lifecycle
 from app.runs.events import EventPublisher, publish_done
 from app.runs.lease import RunLease
 from app.tools import ToolContext, ToolOutcome, dispatch, get_tool_definitions
@@ -39,6 +39,9 @@ class RunnerDeps:
     redis: Redis
     llm: LLMProvider
     embedder: Embedder
+    # Exceptions that interrupt the run from outside, e.g. the task being revoked. They
+    # propagate to the caller, which settles the run, rather than failing it.
+    interrupts: tuple[type[Exception], ...] = ()
 
 
 class RunInProgress(Exception):
@@ -51,6 +54,10 @@ class RunInProgress(Exception):
 
 class _LeaseLost(Exception):
     """Another worker took the run over while this one stalled; it owns the outcome now."""
+
+
+class _Cancelled(Exception):
+    """The run was cancelled, or deleted with its session, while this worker executed it."""
 
 
 async def run_agent(run_id: str, deps: RunnerDeps) -> None:
@@ -140,12 +147,20 @@ class _AgentLoop:
     async def run(self) -> None:
         try:
             await self._loop()
+        except _Cancelled:
+            await self._settle_cancelled()
         except _LeaseLost:
             logger.warning("run_lease_lost")
         except Exception as exc:
+            if isinstance(exc, self._deps.interrupts):
+                raise
             if self._completed:
                 # Only the `done` publish can fail now; the run's outcome is already settled.
                 logger.exception("run_done_not_published")
+                return
+            if await self._stopped_elsewhere():
+                # E.g. a step write failing because the run was deleted with its session.
+                await self._settle_cancelled()
                 return
             await self._fail(exc)
 
@@ -162,6 +177,7 @@ class _AgentLoop:
 
         max_iterations = self._settings.max_iterations
         for iteration in range(1, max_iterations + 1):
+            await self._check_cancelled()
             await self._keep_lease()
             result = await self._call_llm(iteration)
             if not result.tool_calls:
@@ -171,13 +187,32 @@ class _AgentLoop:
             await self._call_tools(iteration, result.tool_calls)
         await self._finish(MAX_ITERATIONS_MESSAGE, iterations=max_iterations, cap_hit=True)
 
+    async def _check_cancelled(self) -> None:
+        """A step boundary: stop here if the run's cancellation was requested."""
+        if await cancellation.is_requested(self._deps.redis, self._run_id):
+            raise _Cancelled
+
+    async def _stopped_elsewhere(self) -> bool:
+        """Whether the run was cancelled, or deleted, behind this worker's back."""
+        return _stopped(await self._status())
+
+    async def _status(self) -> RunStatus | None:
+        async with self._deps.session_factory() as db:
+            return await lifecycle.get_status(db, self._run_id)
+
+    async def _settle_cancelled(self) -> None:
+        logger.info("run_cancelled")
+        async with self._deps.session_factory() as db:
+            await cancellation.settle(db, self._deps.redis, self._run_id)
+
     async def _keep_lease(self) -> None:
         if await self._lease.refresh():
             return
         # The lease lapsed while this worker stalled. Carry on unless someone took over:
         # a redelivery holds the lease now, or already failed the run as worker lost.
-        async with self._deps.session_factory() as db:
-            status = await lifecycle.get_status(db, self._run_id)
+        status = await self._status()
+        if _stopped(status):
+            raise _Cancelled
         if status != RunStatus.RUNNING or not await self._lease.acquire():
             raise _LeaseLost
         logger.info("run_lease_retaken")
@@ -256,6 +291,7 @@ class _AgentLoop:
         return result
 
     async def _call_tools(self, iteration: int, calls: list[ToolCallRequest]) -> None:
+        await self._check_cancelled()
         # Steps are recorded one at a time, in call order; only the tools themselves overlap.
         for call in calls:
             await self._events.record(
@@ -312,6 +348,7 @@ class _AgentLoop:
         await self._events.record(self._run_id, StepType.TOOL_RESULT, payload)
 
     async def _finish(self, content: str, *, iterations: int, cap_hit: bool = False) -> None:
+        await self._check_cancelled()
         await self._events.record(
             self._run_id,
             StepType.FINAL_ANSWER,
@@ -326,7 +363,9 @@ class _AgentLoop:
             )
         self._completed = completed
         if not completed:
-            # Someone else (e.g. a cancellation) already finished the run and owns `done`.
+            if await self._stopped_elsewhere():
+                raise _Cancelled
+            # Another worker took over and already finished the run; it owns `done`.
             logger.info("run_completion_skipped")
             return
         logger.info("run_completed", iterations=iterations, max_iterations_hit=cap_hit)
@@ -371,6 +410,11 @@ class _AgentLoop:
             logger.info("run_failure_skipped")
             return
         await self._events.publish_done(self._run_id, RunStatus.FAILED)
+
+
+def _stopped(status: RunStatus | None) -> bool:
+    """Cancelled, or deleted with its session: either way the run is over."""
+    return status in (RunStatus.CANCELLED, None)
 
 
 def _memory_block(memories: list[RecalledMemory]) -> str:

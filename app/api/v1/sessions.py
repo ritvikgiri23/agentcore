@@ -6,14 +6,14 @@ from fastapi import APIRouter, Depends, Response, status
 from redis.asyncio import Redis
 from sqlalchemy import func, select
 
-from app.api.deps import CurrentUser, DbSession, Enqueuer, PageParams, RedisClient
+from app.api.deps import CurrentUser, DbSession, Enqueuer, PageParams, RedisClient, Revoker
 from app.api.v1.runs import status_url, stream_url
 from app.core.errors import ErrorResponse, ServiceUnavailableError, UnknownToolError
 from app.memory import short_term
 from app.models import AgentRun, AgentSession, RunStatus
 from app.repositories.ownership import get_owned_session
 from app.core.redis import get_redis
-from app.runs import lifecycle
+from app.runs import cancellation, lifecycle
 from app.runs.events import publish_done
 from app.schemas.pagination import Page
 from app.schemas.runs import RunAccepted, RunCreate
@@ -131,7 +131,7 @@ async def get_session(session_id: str, user: CurrentUser, db: DbSession) -> Sess
     "/{session_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     response_class=Response,
-    summary="Delete an agent session",
+    summary="Delete an agent session, cancelling its queued and running runs first",
     responses={**_UNAUTHORIZED, **_NOT_FOUND},
 )
 async def delete_session(
@@ -139,8 +139,11 @@ async def delete_session(
     user: CurrentUser,
     db: DbSession,
     redis: RedisClient,
+    revoke: Revoker,
 ) -> None:
     agent_session = await get_owned_session(db, user.id, session_id)
+    # Before the delete, so no worker keeps executing a run whose session is gone.
+    await cancellation.cancel_session_runs(db, redis, agent_session.id, revoke=revoke)
     await db.delete(agent_session)
     await db.commit()
     # Long-term memories are the user's, not the session's, so they stay.

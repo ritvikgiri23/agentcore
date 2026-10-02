@@ -2,22 +2,32 @@ import json
 from collections.abc import AsyncIterator
 from typing import Annotated, Any, NamedTuple
 
+import structlog
 from fastapi import APIRouter, Depends, status
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from redis.asyncio.client import PubSub
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, DbSession, PageParams, RedisClient, StreamUser
+from app.api.deps import (
+    CurrentUser,
+    DbSession,
+    PageParams,
+    RedisClient,
+    Revoker,
+    StreamUser,
+)
 from app.api.v1 import API_V1_PREFIX
-from app.core.errors import ErrorResponse
+from app.core.errors import ConflictError, ErrorResponse
 from app.models import AgentRun, RunStatus, RunStep
 from app.repositories.ownership import get_owned_run
+from app.runs import cancellation
 from app.runs.stream import run_events, subscribe
 from app.schemas.pagination import Page
 from app.schemas.runs import RunStatusResponse, RunStepResponse
 
 router = APIRouter(prefix="/runs", tags=["runs"])
+logger = structlog.get_logger(__name__)
 
 _ERRORS: dict[int | str, dict[str, Any]] = {
     401: {"model": ErrorResponse, "description": "Missing or invalid token"},
@@ -42,6 +52,38 @@ def stream_url(run_id: str) -> str:
 )
 async def get_run_status(run_id: str, user: CurrentUser, db: DbSession) -> RunStatusResponse:
     run = await get_owned_run(db, user.id, run_id)
+    return _status_response(run, await _count_steps(db, run.id))
+
+
+@router.delete(
+    "/{run_id}",
+    response_model=RunStatusResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Cancel a queued or running run",
+    description=(
+        "A queued run never starts. A running run stops at its next step boundary, or "
+        "is interrupted if it is blocked inside a call. Either way it ends with status "
+        "`cancelled`, a `cancelled` step and a `done` event; the response already shows "
+        "the new status."
+    ),
+    responses={
+        **_ERRORS,
+        409: {"model": ErrorResponse, "description": "The run has already finished"},
+    },
+)
+async def cancel_run(
+    run_id: str, user: CurrentUser, db: DbSession, redis: RedisClient, revoke: Revoker
+) -> RunStatusResponse:
+    run = await get_owned_run(db, user.id, run_id)
+    cancelled_from = await cancellation.request_cancel(
+        db, redis, run.id, reason=cancellation.CancelReason.BY_USER, revoke=revoke
+    )
+    await db.refresh(run)
+    if cancelled_from is None:
+        raise ConflictError(
+            f"Run is already {run.status.value}", details={"status": run.status.value}
+        )
+    logger.info("run_cancelled_by_user")
     return _status_response(run, await _count_steps(db, run.id))
 
 

@@ -1,12 +1,16 @@
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import structlog
+from celery.exceptions import SoftTimeLimitExceeded
 from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
 from app.llm import create_embedder, create_llm_provider
+from app.runs import cancellation
 from app.runs.runner import RunInProgress, RunnerDeps, run_agent
 from app.worker.celery_app import celery_app
 
@@ -43,33 +47,62 @@ def execute_agent_run(run_id: str) -> None:
             task_id=run_id,
             countdown=exc.retry_in + LEASE_RECHECK_SLACK_SECONDS,
         )
+    except SoftTimeLimitExceeded:
+        # Raised by a revoke's SIGUSR1 while the run was blocked inside a call. The loop
+        # it ran on is gone, so the run is settled on a fresh, short one.
+        logger.info("run_terminated", run_id=run_id)
+        asyncio.run(_settle_cancelled(run_id))
 
 
-async def _execute(run_id: str) -> None:
+@asynccontextmanager
+async def _connections() -> AsyncIterator[tuple[async_sessionmaker[AsyncSession], Redis]]:
     # asyncpg connections and the Redis/HTTP clients are bound to the event loop that
     # created them, and each task gets a fresh loop, so nothing is shared across tasks.
     settings = get_settings()
     engine = create_async_engine(settings.database_url, poolclass=NullPool)
     redis: Redis = Redis.from_url(settings.redis_url, decode_responses=True)
+    try:
+        yield async_sessionmaker(engine, expire_on_commit=False), redis
+    finally:
+        await redis.aclose()
+        await engine.dispose()
+
+
+async def _execute(run_id: str) -> None:
+    settings = get_settings()
     llm = create_llm_provider(settings)
     embedder = create_embedder(settings)
     try:
-        await run_agent(
-            run_id,
-            RunnerDeps(
-                session_factory=async_sessionmaker(engine, expire_on_commit=False),
-                redis=redis,
-                llm=llm,
-                embedder=embedder,
-            ),
-        )
+        async with _connections() as (session_factory, redis):
+            await run_agent(
+                run_id,
+                RunnerDeps(
+                    session_factory=session_factory,
+                    redis=redis,
+                    llm=llm,
+                    embedder=embedder,
+                    interrupts=(SoftTimeLimitExceeded,),
+                ),
+            )
     finally:
         await embedder.aclose()
         await llm.aclose()
-        await redis.aclose()
-        await engine.dispose()
+
+
+async def _settle_cancelled(run_id: str) -> None:
+    async with _connections() as (session_factory, redis), session_factory() as db:
+        await cancellation.settle(db, redis, run_id)
 
 
 def enqueue_run(run_id: str) -> None:
     """Hand a run to the broker. Blocking: call it from a worker thread."""
     execute_agent_run.apply_async(args=[run_id], task_id=run_id)
+
+
+def revoke_run(run_id: str) -> None:
+    """Revoke a run's task. Blocking: call it from a worker thread.
+
+    A task not yet started is dropped; one executing gets SIGUSR1, which Celery raises
+    in it as `SoftTimeLimitExceeded`.
+    """
+    celery_app.control.revoke(run_id, terminate=True, signal="SIGUSR1")
