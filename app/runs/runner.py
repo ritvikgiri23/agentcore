@@ -1,6 +1,7 @@
 """The agent loop: LLM call → tool dispatch → feed results back, until a plain answer."""
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,8 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import get_settings
 from app.llm import ChatMessage, ChatResult, Embedder, LLMProvider, ToolCallRequest
-from app.memory import long_term
+from app.memory import long_term, short_term
 from app.memory.long_term import RecalledMemory
+from app.memory.short_term import Turn
 from app.models import AgentRun, AgentSession, RunStatus, StepType
 from app.runs import lifecycle
 from app.runs.events import EventPublisher, publish_done
@@ -61,6 +63,7 @@ class _AgentLoop:
     def __init__(self, run: AgentRun, agent_session: AgentSession, deps: RunnerDeps) -> None:
         self._settings = get_settings()
         self._run_id = run.id
+        self._session_id = agent_session.id
         self._user_message = run.user_message
         self._user_id = agent_session.user_id
         self._system_prompt = agent_session.system_prompt
@@ -89,12 +92,14 @@ class _AgentLoop:
             await self._fail(exc)
 
     async def _loop(self) -> None:
-        memories = await self._retrieve_memories()
+        memories, turns = await self._retrieve_memories()
         system = "\n\n".join(
             part for part in (self._system_prompt, _memory_block(memories)) if part
         )
         if system:
             self._messages.append({"role": "system", "content": system})
+        for turn in turns:
+            self._messages.extend(turn.as_messages())
         self._messages.append({"role": "user", "content": self._user_message})
 
         max_iterations = self._settings.max_iterations
@@ -107,7 +112,13 @@ class _AgentLoop:
             await self._call_tools(iteration, result.tool_calls)
         await self._finish(MAX_ITERATIONS_MESSAGE, iterations=max_iterations, cap_hit=True)
 
-    async def _retrieve_memories(self) -> list[RecalledMemory]:
+    async def _retrieve_memories(self) -> tuple[list[RecalledMemory], list[Turn]]:
+        turns = await short_term.recent_turns(
+            self._deps.redis,
+            self._session_id,
+            # A turn is two messages: the user's and the answer.
+            limit=self._settings.short_term_context_messages // 2,
+        )
         memories: list[RecalledMemory] = []
         top_k = self._settings.long_term_top_k
         with structlog.contextvars.bound_contextvars(
@@ -141,9 +152,10 @@ class _AgentLoop:
                     }
                     for m in memories
                 ],
+                "short_term_turns": len(turns),
             },
         )
-        return memories
+        return memories, turns
 
     async def _call_llm(self, iteration: int) -> ChatResult:
         with structlog.contextvars.bound_contextvars(step_type=StepType.LLM_CALL.value):
@@ -248,7 +260,28 @@ class _AgentLoop:
             logger.info("run_completion_skipped")
             return
         logger.info("run_completed", iterations=iterations, max_iterations_hit=cap_hit)
+        # Only a real answer is worth recalling; a capped or empty one would mislead.
+        if content and not cap_hit:
+            await self._remember_turn(content)
         await self._events.publish_done(self._run_id, RunStatus.COMPLETED)
+
+    async def _remember_turn(self, answer: str) -> None:
+        # Pushed before `done`, so a follow-up sent on `done` already sees this turn.
+        try:
+            await short_term.push_turn(
+                self._deps.redis,
+                self._session_id,
+                Turn(
+                    user=self._user_message,
+                    assistant=answer,
+                    run_id=self._run_id,
+                    ts=time.time(),
+                ),
+                retained=self._settings.short_term_retained_turns,
+            )
+        except Exception:
+            # The run is already completed; losing the turn only costs follow-up context.
+            logger.exception("short_term_turn_not_saved")
 
     async def _fail(self, exc: Exception) -> None:
         # The traceback stays in the logs; the trace only says what went wrong.

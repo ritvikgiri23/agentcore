@@ -203,7 +203,7 @@ async def test_step_trace(
     retrieval, first_llm, tool_call, tool_result, second_llm, final = (
         s["payload"] for s in steps
     )
-    assert retrieval == {"memories": []}
+    assert retrieval == {"memories": [], "short_term_turns": 0}
     call_id = first_llm["tool_calls"][0]["id"]
     assert first_llm == {
         "iteration": 1,

@@ -6,9 +6,10 @@ from fastapi import APIRouter, Depends, Response, status
 from redis.asyncio import Redis
 from sqlalchemy import func, select
 
-from app.api.deps import CurrentUser, DbSession, Enqueuer, PageParams
+from app.api.deps import CurrentUser, DbSession, Enqueuer, PageParams, RedisClient
 from app.api.v1.runs import status_url, stream_url
 from app.core.errors import ErrorResponse, ServiceUnavailableError, UnknownToolError
+from app.memory import short_term
 from app.models import AgentRun, AgentSession, RunStatus
 from app.repositories.ownership import get_owned_session
 from app.core.redis import get_redis
@@ -133,10 +134,17 @@ async def get_session(session_id: str, user: CurrentUser, db: DbSession) -> Sess
     summary="Delete an agent session",
     responses={**_UNAUTHORIZED, **_NOT_FOUND},
 )
-async def delete_session(session_id: str, user: CurrentUser, db: DbSession) -> None:
+async def delete_session(
+    session_id: str,
+    user: CurrentUser,
+    db: DbSession,
+    redis: RedisClient,
+) -> None:
     agent_session = await get_owned_session(db, user.id, session_id)
     await db.delete(agent_session)
     await db.commit()
+    # Long-term memories are the user's, not the session's, so they stay.
+    await short_term.clear(redis, session_id)
     logger.info("session_deleted")
 
 
