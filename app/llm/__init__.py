@@ -8,7 +8,8 @@ from app.llm.base import (
     ToolCallRequest,
     ToolDefinition,
 )
-from app.llm.fake import FakeReply, HashEmbedder, ScriptedLLM
+from app.llm.demo import DemoLLM
+from app.llm.fake import HashEmbedder
 
 __all__ = [
     "ChatMessage",
@@ -21,10 +22,6 @@ __all__ = [
     "create_embedder",
     "create_llm_provider",
 ]
-
-# Until the keyless demo scenario exists, fake mode answers every message with this.
-_FAKE_FALLBACK = FakeReply(content="This is the fake LLM. Configure OPENAI_API_KEY for real answers.")
-
 
 def create_llm_provider(settings: Settings) -> LLMProvider:
     """The provider selected by settings. Callers own it and must `aclose()` it."""
@@ -41,7 +38,7 @@ def create_llm_provider(settings: Settings) -> LLMProvider:
             attempts=settings.llm_retry_attempts,
             base_delay_seconds=settings.llm_retry_base_delay_seconds,
         )
-    return ScriptedLLM(fallback=_FAKE_FALLBACK)
+    return DemoLLM()
 
 
 def create_embedder(settings: Settings) -> Embedder:

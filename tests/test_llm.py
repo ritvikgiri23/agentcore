@@ -2,7 +2,7 @@ from openai.types.chat import ChatCompletion
 
 from app.core.config import Settings
 from app.llm import ChatResult, LLMUsage, ToolCallRequest, create_llm_provider
-from app.llm.fake import ScriptedLLM
+from app.llm.demo import DemoLLM
 from app.llm.openai_provider import normalise_completion
 from app.llm.retry import RetryingLLM
 
@@ -65,7 +65,7 @@ async def test_provider_follows_settings() -> None:
     fake = create_llm_provider(Settings(llm_provider="fake"))
     real = create_llm_provider(Settings(llm_provider="openai", openai_api_key="sk-test"))
     try:
-        assert isinstance(fake, ScriptedLLM)
+        assert isinstance(fake, DemoLLM)
         assert isinstance(real, RetryingLLM)
     finally:
         await fake.aclose()

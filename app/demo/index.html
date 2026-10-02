@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentCore Demo</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --surface: #ffffff; --text: #1d1d1b; --muted: #6b6b66;
+    --border: #e2e1dc; --accent: #2f5bd3; --ok: #217a4b; --err: #b3261e; --code: #f1f0ec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --surface: #1f1f1d; --text: #ecebe6; --muted: #9c9b94;
+      --border: #34332f; --accent: #7d9cf0; --ok: #5cc28c; --err: #f08a80; --code: #2a2a27;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .lede { color: var(--muted); margin: 0 0 24px; }
+  form { display: grid; gap: 12px; background: var(--surface); border: 1px solid var(--border);
+         border-radius: 10px; padding: 16px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 520px) { .row { grid-template-columns: 1fr; } }
+  label { display: grid; gap: 4px; font-size: 0.85rem; color: var(--muted); }
+  input, textarea { font: inherit; color: var(--text); background: var(--bg);
+                    border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+  textarea { resize: vertical; min-height: 64px; }
+  button { justify-self: start; font: inherit; font-weight: 600; color: #fff;
+           background: var(--accent); border: 0; border-radius: 6px; padding: 8px 18px;
+           cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #status { margin: 20px 0 12px; color: var(--muted); min-height: 1.5em; }
+  #status.error { color: var(--err); }
+  ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+  li { background: var(--surface); border: 1px solid var(--border); border-left-width: 4px;
+       border-radius: 8px; padding: 10px 14px; overflow-wrap: anywhere; }
+  li.llm_call { border-left-color: var(--accent); }
+  li.tool_call, li.tool_result { border-left-color: var(--muted); }
+  li.final_answer, li.done-completed { border-left-color: var(--ok); }
+  li.error, li.tool_timeout, li.cancelled, li.done-failed, li.done-cancelled,
+  li.is-error { border-left-color: var(--err); }
+  .type { font-size: 0.75rem; font-weight: 600; letter-spacing: 0.04em;
+          text-transform: uppercase; color: var(--muted); }
+  .summary { margin-top: 2px; white-space: pre-wrap; }
+  li.final_answer .summary { font-size: 1.05rem; font-weight: 500; }
+  details { margin-top: 6px; font-size: 0.8rem; color: var(--muted); }
+  pre { margin: 6px 0 0; padding: 8px; background: var(--code); border-radius: 6px;
+        overflow-x: auto; font-size: 0.8rem; color: var(--text); }
+</style>
+</head>
+<body>
+<main>
+  <h1>AgentCore demo</h1>
+  <p class="lede">Registers (or logs in), creates a "Research Assistant" session with
+    web_search, calculator and remember_fact, submits the prompt and streams every step
+    the agent takes.</p>
+
+  <form id="demo">
+    <div class="row">
+      <label>Email <input id="email" type="email" value="demo@example.com" required></label>
+      <label>Password <input id="password" type="password" value="demo-password" minlength="8" required></label>
+    </div>
+    <label>Prompt <textarea id="prompt" required>{{FLAGSHIP_PROMPT}}</textarea></label>
+    <button id="run" type="submit">Run</button>
+  </form>
+
+  <p id="status" role="status"></p>
+  <ol id="steps"></ol>
+</main>
+
+<script>
+const API = "/api/v1";
+const TOOLS = ["web_search", "calculator", "remember_fact"];
+const $ = (id) => document.getElementById(id);
+
+function setStatus(text, isError = false) {
+  $("status").textContent = text;
+  $("status").className = isError ? "error" : "";
+}
+
+async function api(path, { token, json, form } = {}) {
+  const headers = {};
+  let body;
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (json) { headers["Content-Type"] = "application/json"; body = JSON.stringify(json); }
+  if (form) body = new URLSearchParams(form);
+  const response = await fetch(API + path, { method: "POST", headers, body });
+  const data = await response.json().catch(() => null);
+  if (!response.ok) {
+    const error = new Error(data?.error?.message ?? `${response.status} ${response.statusText}`);
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+async function getToken(email, password) {
+  try {
+    return (await api("/auth/register", { json: { email, password } })).access_token;
+  } catch (error) {
+    if (error.status !== 409) throw error;
+    // Already registered: log in instead.
+    return (await api("/auth/token", { form: { username: email, password } })).access_token;
+  }
+}
+
+function describe(event) {
+  const p = event.payload ?? {};
+  switch (event.step_type) {
+    case "memory_retrieval": {
+      const lines = (p.memories ?? []).map((m) => `• ${m.content}`);
+      return [`Recalled ${lines.length} long-term memories and ${p.short_term_turns} recent turns`,
+              ...lines].join("\n");
+    }
+    case "llm_call": {
+      const next = p.tool_calls?.length
+        ? `wants ${p.tool_calls.map((c) => c.name).join(", ")}`
+        : "answers";
+      return `Iteration ${p.iteration} · ${p.model} ${next} · ${p.usage?.total_tokens ?? 0} tokens`;
+    }
+    case "tool_call": return `${p.name}(${p.arguments})`;
+    case "tool_result": return `${p.name} → ${p.result}${p.truncated ? " …" : ""}`;
+    case "tool_timeout": return `${p.name} timed out after ${p.timeout_seconds}s`;
+    case "final_answer": return p.content;
+    case "error": return `${p.type}: ${p.message}`;
+    case "cancelled": return "The run was cancelled";
+    case "done": return `Run ${event.status}`;
+    default: return "";
+  }
+}
+
+function render(event) {
+  const item = document.createElement("li");
+  item.classList.add(event.step_type);
+  if (event.step_type === "done") item.classList.add(`done-${event.status}`);
+  if (event.payload?.is_error) item.classList.add("is-error");
+  const type = document.createElement("div");
+  type.className = "type";
+  type.textContent = event.step_type.replaceAll("_", " ");
+  const summary = document.createElement("div");
+  summary.className = "summary";
+  summary.textContent = describe(event);
+  item.append(type, summary);
+  if (event.payload) {
+    const details = document.createElement("details");
+    const label = document.createElement("summary");
+    label.textContent = "payload";
+    const pre = document.createElement("pre");
+    pre.textContent = JSON.stringify(event.payload, null, 2);
+    details.append(label, pre);
+    item.append(details);
+  }
+  $("steps").append(item);
+}
+
+function stream(url, token) {
+  return new Promise((resolve) => {
+    const source = new EventSource(`${url}?access_token=${encodeURIComponent(token)}`);
+    // A reconnect replays every persisted step; show each one once.
+    const seen = new Set();
+    source.onmessage = (message) => {
+      const event = JSON.parse(message.data);
+      if (event.id != null) {
+        if (seen.has(event.id)) return;
+        seen.add(event.id);
+      }
+      render(event);
+      if (event.step_type === "done") {
+        source.close();
+        setStatus(`Run ${event.status}.`, event.status !== "completed");
+        resolve();
+      }
+    };
+    source.onerror = () => {
+      // The browser retries dropped connections itself; a refused one is final.
+      if (source.readyState === EventSource.CLOSED) {
+        setStatus("The stream could not be opened.", true);
+        resolve();
+      }
+    };
+  });
+}
+
+$("demo").addEventListener("submit", async (submit) => {
+  submit.preventDefault();
+  $("run").disabled = true;
+  $("steps").replaceChildren();
+  try {
+    setStatus("Signing in…");
+    const token = await getToken($("email").value, $("password").value);
+    setStatus("Creating the Research Assistant session…");
+    const session = await api("/sessions", {
+      token,
+      json: {
+        name: "Research Assistant",
+        system_prompt: "You are a careful research assistant.",
+        tools_enabled: TOOLS,
+      },
+    });
+    setStatus("Submitting the prompt…");
+    const run = await api(`/sessions/${session.id}/run`, {
+      token, json: { message: $("prompt").value },
+    });
+    setStatus(`Run ${run.run_id} queued; streaming steps…`);
+    await stream(run.stream_url, token);
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    $("run").disabled = false;
+  }
+});
+</script>
+</body>
+</html>

@@ -4,7 +4,7 @@ import itertools
 import json
 import math
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -69,24 +69,29 @@ class ScriptedLLM:
             reply = self._fallback
         else:
             raise RuntimeError(f"ScriptedLLM script exhausted after {len(self.requests) - 1} calls")
-        tool_calls = [
-            ToolCallRequest(
-                id=f"call_{next(self._call_ids)}",
-                name=name,
-                arguments=arguments if isinstance(arguments, str) else json.dumps(arguments),
-            )
-            for name, arguments in reply.tool_calls
-        ]
-        return ChatResult(
-            model=FAKE_MODEL,
-            content=reply.content,
-            tool_calls=tool_calls,
-            finish_reason="tool_calls" if tool_calls else "stop",
-            usage=reply.usage,
-        )
+        return to_chat_result(reply, self._call_ids)
 
     async def aclose(self) -> None:
         return None
+
+
+def to_chat_result(reply: FakeReply, call_ids: Iterator[int]) -> ChatResult:
+    """The completion a fake model returns for a reply; tool call ids come from `call_ids`."""
+    tool_calls = [
+        ToolCallRequest(
+            id=f"call_{next(call_ids)}",
+            name=name,
+            arguments=arguments if isinstance(arguments, str) else json.dumps(arguments),
+        )
+        for name, arguments in reply.tool_calls
+    ]
+    return ChatResult(
+        model=FAKE_MODEL,
+        content=reply.content,
+        tool_calls=tool_calls,
+        finish_reason="tool_calls" if tool_calls else "stop",
+        usage=reply.usage,
+    )
 
 
 class HashEmbedder:

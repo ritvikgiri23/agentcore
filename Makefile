@@ -22,5 +22,5 @@ test: ## Run the test suite in a container against the compose Postgres
 migrate: ## Apply database migrations
 	$(COMPOSE) run --rm migrate
 
-demo: ## Placeholder: the keyless browser demo arrives in a later ticket
-	@echo "Demo not implemented yet. Start the stack with 'make up', then: curl localhost:$${API_PORT:-8000}/api/v1/health"
+demo: ## Run the flagship scenario with curl against the running stack (browser: /demo)
+	@sh docker/demo.sh
