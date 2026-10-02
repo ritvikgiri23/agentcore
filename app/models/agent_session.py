@@ -9,6 +9,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if TYPE_CHECKING:
+    from app.models.agent_run import AgentRun
     from app.models.user import User
 
 
@@ -32,3 +33,7 @@ class AgentSession(Base):
     )
 
     user: Mapped["User"] = relationship(back_populates="sessions", lazy="raise")
+    # The database cascade deletes runs; the ORM must not try to load them first.
+    runs: Mapped[list["AgentRun"]] = relationship(
+        back_populates="session", lazy="raise", passive_deletes=True
+    )

@@ -1,15 +1,22 @@
-from typing import Any
+import asyncio
+from typing import Annotated, Any
 
 import structlog
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, Depends, Response, status
+from redis.asyncio import Redis
 from sqlalchemy import func, select
 
-from app.api.deps import CurrentUser, DbSession, PageParams
-from app.core.errors import ErrorResponse, UnknownToolError
-from app.models import AgentSession
+from app.api.deps import CurrentUser, DbSession, Enqueuer, PageParams
+from app.api.v1.runs import status_url, stream_url
+from app.core.errors import ErrorResponse, ServiceUnavailableError, UnknownToolError
+from app.models import AgentRun, AgentSession, RunStatus
 from app.repositories.ownership import get_owned_session
+from app.core.redis import get_redis
+from app.runs import lifecycle
+from app.runs.events import publish_done
 from app.schemas.pagination import Page
-from app.schemas.sessions import SessionCreate, SessionDetail, SessionResponse
+from app.schemas.runs import RunAccepted, RunCreate
+from app.schemas.sessions import RunSummary, SessionCreate, SessionDetail, SessionResponse
 from app.tools import list_tool_names
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
@@ -21,6 +28,9 @@ _UNAUTHORIZED: dict[int | str, dict[str, Any]] = {
 _NOT_FOUND: dict[int | str, dict[str, Any]] = {
     404: {"model": ErrorResponse, "description": "Session not found"},
 }
+
+RECENT_RUNS_LIMIT = 5
+RUN_SUMMARY_MESSAGE_CHARS = 120
 
 
 @router.post(
@@ -94,9 +104,25 @@ async def list_sessions(
 )
 async def get_session(session_id: str, user: CurrentUser, db: DbSession) -> SessionDetail:
     agent_session = await get_owned_session(db, user.id, session_id)
-    # Runs arrive with the run pipeline; until then every session has none.
+    recent_runs = await db.scalars(
+        select(AgentRun)
+        .where(AgentRun.session_id == agent_session.id)
+        .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+        .limit(RECENT_RUNS_LIMIT)
+    )
     return SessionDetail(
-        **SessionResponse.model_validate(agent_session).model_dump(), recent_runs=[]
+        **SessionResponse.model_validate(agent_session).model_dump(),
+        recent_runs=[
+            RunSummary(
+                id=run.id,
+                status=run.status,
+                message=run.user_message[:RUN_SUMMARY_MESSAGE_CHARS],
+                tokens_used=run.tokens_used,
+                created_at=run.created_at,
+                finished_at=run.finished_at,
+            )
+            for run in recent_runs
+        ],
     )
 
 
@@ -112,3 +138,48 @@ async def delete_session(session_id: str, user: CurrentUser, db: DbSession) -> N
     await db.delete(agent_session)
     await db.commit()
     logger.info("session_deleted")
+
+
+@router.post(
+    "/{session_id}/run",
+    response_model=RunAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Submit a message to a session; the agent runs it in the background",
+    responses={
+        **_UNAUTHORIZED,
+        **_NOT_FOUND,
+        422: {"model": ErrorResponse, "description": "Invalid message"},
+        503: {"model": ErrorResponse, "description": "The run could not be queued"},
+    },
+)
+async def submit_run(
+    session_id: str,
+    body: RunCreate,
+    user: CurrentUser,
+    db: DbSession,
+    redis: Annotated[Redis, Depends(get_redis)],
+    enqueue: Enqueuer,
+) -> RunAccepted:
+    agent_session = await get_owned_session(db, user.id, session_id)
+    run = AgentRun(session_id=agent_session.id, user_message=body.message)
+    db.add(run)
+    # Committed before enqueueing, so the worker can always find the run.
+    await db.commit()
+    structlog.contextvars.bind_contextvars(run_id=run.id)
+    try:
+        # Publishing to the broker is blocking network I/O.
+        await asyncio.to_thread(enqueue, run.id)
+    except Exception:
+        logger.exception("run_enqueue_failed")
+        if await lifecycle.fail(db, run.id):
+            await publish_done(redis, run.id, RunStatus.FAILED)
+        raise ServiceUnavailableError(
+            "The run could not be queued; try again", details={"run_id": run.id}
+        ) from None
+    logger.info("run_submitted")
+    return RunAccepted(
+        run_id=run.id,
+        status=RunStatus.QUEUED,
+        status_url=status_url(run.id),
+        stream_url=stream_url(run.id),
+    )

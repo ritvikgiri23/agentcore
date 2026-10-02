@@ -19,10 +19,12 @@ from sqlalchemy.ext.asyncio import (  # noqa: E402
     AsyncConnection,
     AsyncEngine,
     AsyncSession,
+    async_sessionmaker,
     create_async_engine,
 )
 from sqlalchemy.pool import NullPool  # noqa: E402
 
+from app.api.deps import get_run_enqueuer  # noqa: E402
 from app.core.config import get_settings  # noqa: E402
 from app.core.redis import get_redis  # noqa: E402
 from app.core.security import create_access_token, hash_password  # noqa: E402
@@ -30,7 +32,9 @@ from app.db.base import Base  # noqa: E402
 from app.db.session import get_db  # noqa: E402
 from app.main import create_app  # noqa: E402
 # Importing app.models registers every table.
-from app.models import AgentSession, User  # noqa: E402
+from app.llm import LLMProvider  # noqa: E402
+from app.models import AgentRun, AgentSession, RunStatus, RunStep, User  # noqa: E402
+from app.runs.runner import RunnerDeps, run_agent  # noqa: E402
 from app.tools import TOOL_REGISTRY, ToolContext  # noqa: E402
 
 
@@ -81,7 +85,13 @@ async def redis() -> AsyncIterator[FakeAsyncRedis]:
 
 
 @pytest.fixture
-def app(db_session: AsyncSession, redis: FakeAsyncRedis) -> FastAPI:
+def enqueued() -> list[str]:
+    """Run ids the API handed to the broker; tests never talk to a real one."""
+    return []
+
+
+@pytest.fixture
+def app(db_session: AsyncSession, redis: FakeAsyncRedis, enqueued: list[str]) -> FastAPI:
     app = create_app()
 
     async def _get_db() -> AsyncIterator[AsyncSession]:
@@ -92,6 +102,7 @@ def app(db_session: AsyncSession, redis: FakeAsyncRedis) -> FastAPI:
 
     app.dependency_overrides[get_db] = _get_db
     app.dependency_overrides[get_redis] = _get_redis
+    app.dependency_overrides[get_run_enqueuer] = lambda: enqueued.append
     return app
 
 
@@ -193,3 +204,62 @@ def agent_session_factory(db_session: AsyncSession) -> AgentSessionFactory:
         return agent_session
 
     return make
+
+
+class AgentRunFactory(Protocol):
+    def __call__(
+        self,
+        agent_session: AgentSession,
+        user_message: str = ...,
+        status: RunStatus = ...,
+    ) -> Awaitable[AgentRun]: ...
+
+
+@pytest.fixture
+def agent_run_factory(db_session: AsyncSession) -> AgentRunFactory:
+    """Create persisted runs in a given state."""
+
+    async def make(
+        agent_session: AgentSession,
+        user_message: str = "What is 15% of 3,655,000?",
+        status: RunStatus = RunStatus.QUEUED,
+    ) -> AgentRun:
+        run = AgentRun(session_id=agent_session.id, user_message=user_message, status=status)
+        db_session.add(run)
+        await db_session.commit()
+        return run
+
+    return make
+
+
+@pytest.fixture
+def worker_session_factory(db_connection: AsyncConnection) -> async_sessionmaker[AsyncSession]:
+    """What the worker's per-task engine provides, bound to the test transaction."""
+    return async_sessionmaker(
+        bind=db_connection, expire_on_commit=False, join_transaction_mode="create_savepoint"
+    )
+
+
+class RunExecutor(Protocol):
+    def __call__(self, run_id: str, llm: LLMProvider) -> Awaitable[None]: ...
+
+
+@pytest.fixture
+def execute_run(
+    db_session: AsyncSession,
+    redis: FakeAsyncRedis,
+    worker_session_factory: async_sessionmaker[AsyncSession],
+) -> RunExecutor:
+    """Execute a run in-process through the entry point the Celery task uses."""
+
+    async def execute(run_id: str, llm: LLMProvider) -> None:
+        await run_agent(
+            run_id, RunnerDeps(session_factory=worker_session_factory, redis=redis, llm=llm)
+        )
+        # The worker wrote through its own sessions, so cached runs and steps are stale.
+        # Expunged rather than expired: tests keep reading attributes of objects they hold.
+        for obj in list(db_session.identity_map.values()):
+            if isinstance(obj, (AgentRun, RunStep)):
+                db_session.expunge(obj)
+
+    return execute

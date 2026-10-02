@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Annotated
 
@@ -11,6 +12,7 @@ from app.core.security import decode_access_token
 from app.db.session import get_db
 from app.models import User
 from app.schemas.pagination import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, MAX_PAGE_OFFSET
+from app.worker.tasks import enqueue_run
 
 # auto_error=False so a missing token is rendered by our own 401 envelope.
 _bearer = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token", auto_error=False)
@@ -43,6 +45,15 @@ def get_pagination(
     return Pagination(limit=limit, offset=offset)
 
 
+type RunEnqueuer = Callable[[str], None]
+
+
+def get_run_enqueuer() -> RunEnqueuer:
+    """Hands a run id to the broker. Overridden in tests, which never run a broker."""
+    return enqueue_run
+
+
 CurrentUser = Annotated[User, Depends(get_current_user)]
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 PageParams = Annotated[Pagination, Depends(get_pagination)]
+Enqueuer = Annotated[RunEnqueuer, Depends(get_run_enqueuer)]

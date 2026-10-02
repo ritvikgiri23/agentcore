@@ -7,7 +7,12 @@ configure_logging()
 
 settings = get_settings()
 
-celery_app = Celery("agentcore", broker=settings.redis_url, backend=settings.redis_url)
+celery_app = Celery(
+    "agentcore",
+    broker=settings.redis_url,
+    backend=settings.redis_url,
+    include=["app.worker.tasks"],
+)
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],

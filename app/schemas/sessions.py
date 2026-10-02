@@ -10,8 +10,10 @@ from pydantic import (
     field_validator,
 )
 
+from app.models import RunStatus
 
-def _reject_nul(value: str) -> str:
+
+def reject_nul(value: str) -> str:
     # Postgres text columns cannot store NUL characters.
     if "\x00" in value:
         raise ValueError("must not contain NUL characters")
@@ -22,10 +24,10 @@ class SessionCreate(BaseModel):
     name: Annotated[
         str,
         StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
-        AfterValidator(_reject_nul),
+        AfterValidator(reject_nul),
     ]
     system_prompt: Annotated[
-        str, StringConstraints(max_length=4000), AfterValidator(_reject_nul)
+        str, StringConstraints(max_length=4000), AfterValidator(reject_nul)
     ]
     tools_enabled: list[Annotated[str, StringConstraints(max_length=64)]] = Field(
         default_factory=list, max_length=50, description="Tool names; duplicates are ignored"
@@ -49,7 +51,7 @@ class SessionResponse(BaseModel):
 
 class RunSummary(BaseModel):
     id: str
-    status: str
+    status: RunStatus
     message: str = Field(description="The run's user message, truncated to 120 characters")
     tokens_used: int
     created_at: datetime

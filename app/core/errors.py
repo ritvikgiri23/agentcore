@@ -67,6 +67,12 @@ class RateLimitedError(AppError):
     message = "Too many requests"
 
 
+class ServiceUnavailableError(AppError):
+    status_code = 503
+    code = "service_unavailable"
+    message = "Service temporarily unavailable"
+
+
 class ValidationFailedError(AppError):
     status_code = 422
     code = "validation_error"
@@ -89,6 +95,7 @@ _HTTP_CODES: dict[int, str] = {
     409: "conflict",
     422: "validation_error",
     429: "rate_limited",
+    503: "service_unavailable",
 }
 
 
