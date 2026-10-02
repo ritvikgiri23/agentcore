@@ -1,0 +1,32 @@
+# Development override: mounts the source, installs dev dependencies, enables reload
+# and publishes Postgres/Redis on the host so tests can run outside the container.
+x-dev: &dev
+  build:
+    context: .
+    args:
+      INSTALL_DEV: "true"
+  image: agentcore-app-dev
+  volumes:
+    - ./app:/app/app
+    - ./alembic:/app/alembic
+    - ./tests:/app/tests
+
+services:
+  postgres:
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+
+  redis:
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+
+  migrate:
+    <<: *dev
+
+  api:
+    <<: *dev
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--reload", "--reload-dir", "/app/app"]
+
+  worker:
+    <<: *dev
+    command: ["watchfiles", "--filter", "python", "celery -A app.worker.celery_app worker --pool=prefork --concurrency=4 --loglevel=INFO", "/app/app"]
