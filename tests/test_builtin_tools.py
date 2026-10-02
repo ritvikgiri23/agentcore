@@ -3,9 +3,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from app.llm import LLMUsage
+from app.llm.fake import FakeReply, ScriptedLLM
 from app.tools import ToolContext, ToolOutcome, dispatch, list_tool_names
 
-BUILTIN_TOOLS = ["calculator", "get_current_datetime", "web_search"]
+BUILTIN_TOOLS = ["calculator", "get_current_datetime", "summarise_text", "web_search"]
 
 
 async def calculate(expression: str, ctx: ToolContext) -> ToolOutcome:
@@ -177,3 +179,54 @@ async def test_get_current_datetime_returns_utc_iso_timestamp(tool_context: Tool
     assert outcome.is_error is False
     assert stamp.utcoffset() == timedelta(0)
     assert abs(datetime.now(UTC) - stamp) < timedelta(seconds=5)
+
+
+async def summarise(ctx: ToolContext, text: str, **args: object) -> ToolOutcome:
+    return await dispatch(
+        "summarise_text", json.dumps({"text": text, **args}), ["summarise_text"], ctx
+    )
+
+
+async def test_summarise_text_asks_for_a_word_limit_without_tools() -> None:
+    llm = ScriptedLLM([FakeReply(content="A short summary.")])
+    ctx = ToolContext(user_id="test-user", run_id="test-run", llm=llm)
+
+    outcome = await summarise(ctx, "Some long material.", max_words=20)
+
+    assert (outcome.result, outcome.is_error) == ("A short summary.", False)
+    [request] = llm.requests
+    assert request.tools == []
+    assert request.messages[0]["role"] == "system"
+    assert "at most 20 words" in request.messages[0]["content"]
+    assert request.messages[1] == {"role": "user", "content": "Some long material."}
+
+
+async def test_summarise_text_hard_truncates_to_max_words() -> None:
+    llm = ScriptedLLM([FakeReply(content="  one two\nthree   four five six  ")])
+    ctx = ToolContext(user_id="test-user", run_id="test-run", llm=llm)
+
+    outcome = await summarise(ctx, "text", max_words=4)
+
+    assert outcome.result == "one two three four"
+
+
+async def test_summarise_text_adds_its_usage_to_the_context() -> None:
+    llm = ScriptedLLM([FakeReply(content="Summary.", usage=LLMUsage(30, 7))])
+    ctx = ToolContext(user_id="test-user", run_id="test-run", llm=llm)
+    ctx.usage.add(LLMUsage(100, 10))
+
+    await summarise(ctx, "text")
+
+    assert (ctx.usage.prompt_tokens, ctx.usage.completion_tokens) == (130, 17)
+
+
+@pytest.mark.parametrize("max_words", [0, 1001])
+async def test_summarise_text_bounds_max_words(max_words: int) -> None:
+    llm = ScriptedLLM()
+    ctx = ToolContext(user_id="test-user", run_id="test-run", llm=llm)
+
+    outcome = await summarise(ctx, "text", max_words=max_words)
+
+    assert outcome.is_error is True
+    assert outcome.result.startswith("Invalid arguments for 'summarise_text': max_words:")
+    assert llm.requests == []

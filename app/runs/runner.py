@@ -1,5 +1,6 @@
 """The agent loop: LLM call → tool dispatch → feed results back, until a plain answer."""
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -63,11 +64,22 @@ class _AgentLoop:
             llm=deps.llm,
         )
         self._messages: list[ChatMessage] = []
+        self._completed = False
         if agent_session.system_prompt:
             self._messages.append({"role": "system", "content": agent_session.system_prompt})
         self._messages.append({"role": "user", "content": run.user_message})
 
     async def run(self) -> None:
+        try:
+            await self._loop()
+        except Exception as exc:
+            if self._completed:
+                # Only the `done` publish can fail now; the run's outcome is already settled.
+                logger.exception("run_done_not_published")
+                return
+            await self._fail(exc)
+
+    async def _loop(self) -> None:
         max_iterations = self._settings.max_iterations
         for iteration in range(1, max_iterations + 1):
             result = await self._call_llm(iteration)
@@ -75,14 +87,13 @@ class _AgentLoop:
                 await self._finish(result.content or "", iterations=iteration)
                 return
             self._messages.append(result.as_assistant_message())
-            for call in result.tool_calls:
-                await self._call_tool(iteration, call)
+            await self._call_tools(iteration, result.tool_calls)
         await self._finish(MAX_ITERATIONS_MESSAGE, iterations=max_iterations, cap_hit=True)
 
     async def _call_llm(self, iteration: int) -> ChatResult:
         with structlog.contextvars.bound_contextvars(step_type=StepType.LLM_CALL.value):
             result = await self._deps.llm.chat(self._messages, self._tool_definitions)
-        self._ctx.usage.add(result.usage.prompt_tokens, result.usage.completion_tokens)
+        self._ctx.usage.add(result.usage)
         async with self._deps.session_factory() as db:
             await lifecycle.set_tokens_used(db, self._run_id, self._ctx.usage.total_tokens)
         await self._events.record(
@@ -107,30 +118,38 @@ class _AgentLoop:
         )
         return result
 
-    async def _call_tool(self, iteration: int, call: ToolCallRequest) -> None:
-        await self._events.record(
-            self._run_id,
-            StepType.TOOL_CALL,
-            {
-                "iteration": iteration,
-                "tool_call_id": call.id,
-                "name": call.name,
-                "arguments": call.arguments,
-            },
-        )
-        with structlog.contextvars.bound_contextvars(step_type=StepType.TOOL_CALL.value):
-            outcome = await dispatch(
-                call.name,
-                call.arguments,
-                self._enabled_tools,
-                self._ctx,
-                timeout=self._settings.tool_timeout_seconds,
+    async def _call_tools(self, iteration: int, calls: list[ToolCallRequest]) -> None:
+        # Steps are recorded one at a time, in call order; only the tools themselves overlap.
+        for call in calls:
+            await self._events.record(
+                self._run_id,
+                StepType.TOOL_CALL,
+                {
+                    "iteration": iteration,
+                    "tool_call_id": call.id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                },
             )
-        await self._record_outcome(call, outcome)
-        # Every tool call id needs a reply, error or not; the model sees the full result.
-        self._messages.append(
-            {"role": "tool", "tool_call_id": call.id, "content": outcome.result}
-        )
+        with structlog.contextvars.bound_contextvars(step_type=StepType.TOOL_CALL.value):
+            outcomes = await asyncio.gather(
+                *(
+                    dispatch(
+                        call.name,
+                        call.arguments,
+                        self._enabled_tools,
+                        self._ctx,
+                        timeout=self._settings.tool_timeout_seconds,
+                    )
+                    for call in calls
+                )
+            )
+        for call, outcome in zip(calls, outcomes, strict=True):
+            await self._record_outcome(call, outcome)
+            # Every tool call id needs a reply, error or not; the model sees the full result.
+            self._messages.append(
+                {"role": "tool", "tool_call_id": call.id, "content": outcome.result}
+            )
 
     async def _record_outcome(self, call: ToolCallRequest, outcome: ToolOutcome) -> None:
         if outcome.timed_out:
@@ -168,9 +187,29 @@ class _AgentLoop:
                 final_answer=content,
                 tokens_used=self._ctx.usage.total_tokens,
             )
+        self._completed = completed
         if not completed:
             # Someone else (e.g. a cancellation) already finished the run and owns `done`.
             logger.info("run_completion_skipped")
             return
         logger.info("run_completed", iterations=iterations, max_iterations_hit=cap_hit)
         await self._events.publish_done(self._run_id, RunStatus.COMPLETED)
+
+    async def _fail(self, exc: Exception) -> None:
+        # The traceback stays in the logs; the trace only says what went wrong.
+        logger.exception("run_failed")
+        try:
+            await self._events.record(
+                self._run_id, StepType.ERROR, {"type": type(exc).__name__, "message": str(exc)}
+            )
+        except Exception:
+            # Whatever broke may also break recording; the run must still end as failed.
+            logger.exception("run_error_step_not_recorded")
+        async with self._deps.session_factory() as db:
+            failed = await lifecycle.fail(
+                db, self._run_id, tokens_used=self._ctx.usage.total_tokens
+            )
+        if not failed:
+            logger.info("run_failure_skipped")
+            return
+        await self._events.publish_done(self._run_id, RunStatus.FAILED)

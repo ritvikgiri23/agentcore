@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Any
 
@@ -292,3 +293,336 @@ async def test_database_rejects_unknown_step_types(
     with pytest.raises(IntegrityError, match="ck_run_steps_step_type"):
         await db_session.flush()
     await db_session.rollback()
+
+
+async def _tool_messages(llm: ScriptedLLM, request_index: int) -> list[dict[str, Any]]:
+    return [m for m in llm.requests[request_index].messages if m["role"] == "tool"]
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments", "expected"),
+    [
+        (
+            "teleport",
+            {},
+            "Unknown tool 'teleport'. Available tools: calculator, web_search",
+        ),
+        (
+            "get_current_datetime",
+            {},
+            "Tool 'get_current_datetime' is not enabled for this session. "
+            "Available tools: calculator, web_search",
+        ),
+        ("calculator", '{"expression": ', "Invalid JSON arguments for 'calculator':"),
+        ("calculator", {"expr": "1 + 1"}, "Invalid arguments for 'calculator':"),
+    ],
+    ids=["hallucinated-tool", "disabled-tool", "malformed-json", "invalid-args"],
+)
+async def test_bad_tool_calls_become_error_results_and_the_loop_continues(
+    authed_user: AuthedUser,
+    agent_session_factory: AgentSessionFactory,
+    agent_run_factory: AgentRunFactory,
+    execute_run: RunExecutor,
+    db_session: AsyncSession,
+    name: str,
+    arguments: dict[str, Any] | str,
+    expected: str,
+) -> None:
+    run = await agent_run_factory(
+        await agent_session_factory(authed_user, tools_enabled=["calculator", "web_search"])
+    )
+    llm = ScriptedLLM([call_tool(name, arguments), answer("Recovered.")])
+
+    await execute_run(run.id, llm)
+
+    steps = await _steps(db_session, run.id)
+    assert [s.step_type for s in steps] == [
+        "llm_call",
+        "tool_call",
+        "tool_result",
+        "llm_call",
+        "final_answer",
+    ]
+    result = steps[2].payload
+    assert result["tool_call_id"] == "call_1"
+    assert result["name"] == name
+    assert result["is_error"] is True
+    assert result["result"].startswith(expected)
+    [tool_message] = await _tool_messages(llm, 1)
+    assert tool_message["tool_call_id"] == "call_1"
+    assert tool_message["content"].startswith(expected)
+    finished = await _run(db_session, run.id)
+    assert finished.status == RunStatus.COMPLETED
+    assert finished.final_answer == "Recovered."
+
+
+async def test_disabled_tool_is_refused_even_though_its_schema_was_never_sent(
+    authed_user: AuthedUser,
+    agent_session_factory: AgentSessionFactory,
+    agent_run_factory: AgentRunFactory,
+    execute_run: RunExecutor,
+    isolated_registry: None,
+) -> None:
+    ran = False
+
+    @tool
+    def launch_missiles() -> str:
+        """Not something this session may do."""
+        nonlocal ran
+        ran = True
+        return "launched"
+
+    run = await agent_run_factory(
+        await agent_session_factory(authed_user, tools_enabled=["calculator"])
+    )
+    llm = ScriptedLLM([call_tool("launch_missiles", {}), answer("ok")])
+
+    await execute_run(run.id, llm)
+
+    assert [t["function"]["name"] for t in llm.requests[0].tools] == ["calculator"]
+    assert ran is False
+    [tool_message] = await _tool_messages(llm, 1)
+    assert tool_message["content"].startswith("Tool 'launch_missiles' is not enabled")
+
+
+async def test_tool_exception_becomes_an_error_result_and_the_loop_continues(
+    authed_user: AuthedUser,
+    agent_session_factory: AgentSessionFactory,
+    agent_run_factory: AgentRunFactory,
+    execute_run: RunExecutor,
+    db_session: AsyncSession,
+    isolated_registry: None,
+) -> None:
+    @tool
+    def explode() -> str:
+        """Always fails."""
+        raise RuntimeError("kaboom")
+
+    run = await agent_run_factory(
+        await agent_session_factory(authed_user, tools_enabled=["explode"])
+    )
+    llm = ScriptedLLM([call_tool("explode", {}), answer("It broke.")])
+
+    await execute_run(run.id, llm)
+
+    result = next(s for s in await _steps(db_session, run.id) if s.step_type == "tool_result")
+    assert result.payload["is_error"] is True
+    assert result.payload["result"] == "Error in 'explode': RuntimeError: kaboom"
+    assert (await _run(db_session, run.id)).status == RunStatus.COMPLETED
+
+
+async def test_tool_timeout_records_a_timeout_step_and_the_loop_continues(
+    authed_user: AuthedUser,
+    agent_session_factory: AgentSessionFactory,
+    agent_run_factory: AgentRunFactory,
+    execute_run: RunExecutor,
+    db_session: AsyncSession,
+    isolated_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(get_settings(), "tool_timeout_seconds", 0.05)
+
+    @tool
+    async def dawdle() -> str:
+        """Takes far too long."""
+        await asyncio.sleep(10)
+        return "finally"
+
+    run = await agent_run_factory(
+        await agent_session_factory(authed_user, tools_enabled=["dawdle"])
+    )
+    llm = ScriptedLLM([call_tool("dawdle", {}), answer("Gave up waiting.")])
+
+    await execute_run(run.id, llm)
+
+    steps = await _steps(db_session, run.id)
+    assert [s.step_type for s in steps] == [
+        "llm_call",
+        "tool_call",
+        "tool_timeout",
+        "llm_call",
+        "final_answer",
+    ]
+    assert steps[2].payload == {
+        "tool_call_id": "call_1",
+        "name": "dawdle",
+        "timeout_seconds": 0.05,
+    }
+    [tool_message] = await _tool_messages(llm, 1)
+    assert tool_message == {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "Tool 'dawdle' timed out after 0.05 seconds",
+    }
+    assert (await _run(db_session, run.id)).status == RunStatus.COMPLETED
+
+
+async def test_parallel_tool_calls_run_concurrently_and_keep_their_order(
+    authed_user: AuthedUser,
+    agent_session_factory: AgentSessionFactory,
+    agent_run_factory: AgentRunFactory,
+    execute_run: RunExecutor,
+    db_session: AsyncSession,
+    isolated_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run one at a time, neither tool could get past the barrier and both would time out.
+    monkeypatch.setattr(get_settings(), "tool_timeout_seconds", 1.0)
+    barrier = asyncio.Barrier(2)
+    finished_order: list[str] = []
+
+    @tool
+    async def slow(text: str) -> str:
+        """Wait for the other tool, then take a while longer."""
+        await barrier.wait()
+        await asyncio.sleep(0.05)
+        finished_order.append("slow")
+        return f"slow:{text}"
+
+    @tool
+    async def fast(text: str) -> str:
+        """Wait for the other tool, then return at once."""
+        await barrier.wait()
+        finished_order.append("fast")
+        return f"fast:{text}"
+
+    run = await agent_run_factory(
+        await agent_session_factory(authed_user, tools_enabled=["slow", "fast"])
+    )
+    llm = ScriptedLLM(
+        [
+            FakeReply(
+                tool_calls=[("slow", {"text": "a"}), ("fast", {"text": "b"}), ("teleport", {})]
+            ),
+            answer("done"),
+        ]
+    )
+
+    await execute_run(run.id, llm)
+
+    assert finished_order == ["fast", "slow"]
+    steps = await _steps(db_session, run.id)
+    assert [s.step_type for s in steps] == [
+        "llm_call",
+        "tool_call",
+        "tool_call",
+        "tool_call",
+        "tool_result",
+        "tool_result",
+        "tool_result",
+        "llm_call",
+        "final_answer",
+    ]
+    assert [s.payload["tool_call_id"] for s in steps[1:7]] == ["call_1", "call_2", "call_3"] * 2
+    assert [s.payload["is_error"] for s in steps[4:7]] == [False, False, True]
+    assert await _tool_messages(llm, 1) == [
+        {"role": "tool", "tool_call_id": "call_1", "content": "slow:a"},
+        {"role": "tool", "tool_call_id": "call_2", "content": "fast:b"},
+        {
+            "role": "tool",
+            "tool_call_id": "call_3",
+            "content": "Unknown tool 'teleport'. Available tools: fast, slow",
+        },
+    ]
+
+
+async def test_unhandled_exception_fails_the_run_with_an_error_step(
+    authed_user: AuthedUser,
+    agent_session_factory: AgentSessionFactory,
+    agent_run_factory: AgentRunFactory,
+    execute_run: RunExecutor,
+    db_session: AsyncSession,
+    redis: FakeAsyncRedis,
+) -> None:
+    run = await agent_run_factory(await agent_session_factory(authed_user))
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(run_channel(run.id))
+    # The script runs out on the second call, so the provider raises mid-loop.
+    llm = ScriptedLLM([call_tool("calculator", {"expression": "1 + 1"})])
+
+    await execute_run(run.id, llm)
+
+    steps = await _steps(db_session, run.id)
+    assert [s.step_type for s in steps] == ["llm_call", "tool_call", "tool_result", "error"]
+    assert steps[-1].payload == {
+        "type": "RuntimeError",
+        "message": "ScriptedLLM script exhausted after 1 calls",
+    }
+    finished = await _run(db_session, run.id)
+    assert finished.status == RunStatus.FAILED
+    assert finished.finished_at is not None
+    assert finished.final_answer is None
+    assert finished.tokens_used == 15
+    events = []
+    while (message := await pubsub.get_message(timeout=0)) is not None:
+        if message["type"] == "message":
+            events.append(json.loads(message["data"]))
+    assert events[-1] == {"step_type": "done", "status": "failed"}
+    await pubsub.aclose()  # type: ignore[no-untyped-call]
+
+
+async def test_summarise_text_usage_is_included_in_tokens_used(
+    authed_user: AuthedUser,
+    agent_session_factory: AgentSessionFactory,
+    agent_run_factory: AgentRunFactory,
+    execute_run: RunExecutor,
+    db_session: AsyncSession,
+) -> None:
+    run = await agent_run_factory(
+        await agent_session_factory(authed_user, tools_enabled=["summarise_text"])
+    )
+    llm = ScriptedLLM(
+        [
+            FakeReply(
+                tool_calls=[("summarise_text", {"text": "A long text.", "max_words": 3})],
+                usage=LLMUsage(100, 10),
+            ),
+            # The nested call made by the tool.
+            FakeReply(content="One two three four five", usage=LLMUsage(40, 4)),
+            FakeReply(content="Summarised.", usage=LLMUsage(200, 3)),
+        ]
+    )
+
+    await execute_run(run.id, llm)
+
+    nested = llm.requests[1]
+    assert nested.tools == []
+    assert "3 words" in nested.messages[0]["content"]
+    assert nested.messages[-1] == {"role": "user", "content": "A long text."}
+    [tool_message] = await _tool_messages(llm, 2)
+    assert tool_message["content"] == "One two three"
+    finished = await _run(db_session, run.id)
+    assert finished.status == RunStatus.COMPLETED
+    assert finished.tokens_used == 110 + 44 + 203
+
+
+class _DoneFailingRedis(FakeAsyncRedis):
+    """Publishes steps normally but fails to publish the terminal `done` event."""
+
+    async def publish(self, channel: ChannelT, message: EncodableT, **kwargs: Any) -> int:
+        assert isinstance(message, str)
+        if json.loads(message)["step_type"] == "done":
+            raise ConnectionError("redis went away")
+        result: int = await super().publish(channel, message, **kwargs)
+        return result
+
+
+async def test_failure_after_completion_does_not_add_an_error_step(
+    authed_user: AuthedUser,
+    agent_session_factory: AgentSessionFactory,
+    agent_run_factory: AgentRunFactory,
+    worker_session_factory: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+) -> None:
+    run = await agent_run_factory(await agent_session_factory(authed_user))
+    redis = _DoneFailingRedis(decode_responses=True)
+
+    try:
+        await run_agent(
+            run.id, RunnerDeps(worker_session_factory, redis, ScriptedLLM([answer("Hi.")]))
+        )
+    finally:
+        await redis.aclose()
+
+    assert [s.step_type for s in await _steps(db_session, run.id)] == ["llm_call", "final_answer"]
+    assert (await _run(db_session, run.id)).status == RunStatus.COMPLETED

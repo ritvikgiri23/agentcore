@@ -6,6 +6,8 @@ from typing import Any, get_type_hints
 from pydantic import BaseModel, ConfigDict, create_model
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.llm.base import LLMProvider, LLMUsage
+
 
 @dataclass
 class TokenUsage:
@@ -18,9 +20,9 @@ class TokenUsage:
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
 
-    def add(self, prompt_tokens: int, completion_tokens: int) -> None:
-        self.prompt_tokens += prompt_tokens
-        self.completion_tokens += completion_tokens
+    def add(self, usage: LLMUsage) -> None:
+        self.prompt_tokens += usage.prompt_tokens
+        self.completion_tokens += usage.completion_tokens
 
 
 @dataclass
@@ -30,8 +32,7 @@ class ToolContext:
     user_id: str
     run_id: str
     session_factory: async_sessionmaker[AsyncSession] | None = None
-    # The LLM provider; typed loosely until the planner abstraction exists.
-    llm: Any = None
+    llm: LLMProvider | None = None
     usage: TokenUsage = field(default_factory=TokenUsage)
 
 

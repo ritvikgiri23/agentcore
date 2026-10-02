@@ -49,9 +49,10 @@ async def complete(db: AsyncSession, run_id: str, *, final_answer: str, tokens_u
     )
 
 
-async def fail(db: AsyncSession, run_id: str) -> bool:
+async def fail(db: AsyncSession, run_id: str, *, tokens_used: int | None = None) -> bool:
     """queued|running → failed. False if the run was already terminal."""
-    return await _finish(db, run_id, RunStatus.FAILED, from_statuses=_ACTIVE)
+    values = {} if tokens_used is None else {"tokens_used": tokens_used}
+    return await _finish(db, run_id, RunStatus.FAILED, from_statuses=_ACTIVE, **values)
 
 
 async def _finish(

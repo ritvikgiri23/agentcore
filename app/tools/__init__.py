@@ -9,7 +9,7 @@ from app.tools.registry import (
 )
 
 # Importing the tool modules registers their tools.
-from app.tools import calculator, clock, web_search  # noqa: F401
+from app.tools import calculator, clock, summarise, web_search  # noqa: F401
 
 __all__ = [
     "TOOL_REGISTRY",
