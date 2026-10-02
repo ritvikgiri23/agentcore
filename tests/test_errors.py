@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from httpx import AsyncClient
 
 from app.core.errors import ConflictError
@@ -76,3 +76,19 @@ async def test_method_not_allowed_uses_envelope(client: AsyncClient) -> None:
 
     assert response.status_code == 405
     assert response.json()["error"]["code"] == "method_not_allowed"
+
+
+async def test_http_exception_with_structured_detail_puts_it_in_details(
+    app: FastAPI, client: AsyncClient
+) -> None:
+    @app.get("/api/v1/_teapot")
+    async def teapot() -> None:
+        raise HTTPException(status_code=400, detail={"reason": "short and stout"})
+
+    response = await client.get("/api/v1/_teapot")
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "bad_request"
+    assert error["message"] == "Bad Request"
+    assert error["details"] == {"reason": "short and stout"}

@@ -1,8 +1,11 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_DEV_JWT_SECRET = "dev-insecure-secret-change-me"
 
 
 class Settings(BaseSettings):
@@ -12,7 +15,7 @@ class Settings(BaseSettings):
 
     # General
     environment: Literal["development", "test", "production"] = "development"
-    log_level: str = "INFO"
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     # Infrastructure
     database_url: str = "postgresql+asyncpg://agentcore:agentcore@localhost:5432/agentcore"
@@ -22,7 +25,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     # Auth
-    jwt_secret: SecretStr = SecretStr("dev-insecure-secret-change-me")
+    jwt_secret: SecretStr = SecretStr(_DEV_JWT_SECRET)
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = Field(default=30, gt=0)
 
@@ -50,8 +53,17 @@ class Settings(BaseSettings):
     max_active_runs_per_user: int = Field(default=10, gt=0)
     run_lease_ttl_seconds: int = Field(default=120, gt=0)
 
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _uppercase_log_level(cls, value: object) -> object:
+        return value.upper() if isinstance(value, str) else value
+
     @model_validator(mode="after")
-    def _default_llm_provider(self) -> "Settings":
+    def _resolve_and_check(self) -> "Settings":
+        if self.environment == "production" and (
+            self.jwt_secret.get_secret_value() == _DEV_JWT_SECRET
+        ):
+            raise ValueError("JWT_SECRET must be set in production")
         if self.llm_provider is None:
             self.llm_provider = "openai" if self.openai_api_key else "fake"
         if self.llm_provider == "openai" and self.openai_api_key is None:

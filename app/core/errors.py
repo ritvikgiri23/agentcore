@@ -98,6 +98,8 @@ def error_response(
         error=ErrorBody(code=code, message=message, details=details, request_id=request_id)
     )
     response_headers = dict(headers or {})
+    # Also set here, not only in RequestContextMiddleware: unhandled exceptions are
+    # rendered by Starlette's ServerErrorMiddleware, which sits outside it.
     if request_id:
         response_headers[REQUEST_ID_HEADER] = request_id
     return JSONResponse(
@@ -109,6 +111,10 @@ def error_response(
 
 async def _app_error_handler(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, AppError)
+    return _render_app_error(request, exc)
+
+
+def _render_app_error(request: Request, exc: AppError) -> JSONResponse:
     return error_response(
         request,
         status_code=exc.status_code,
@@ -120,11 +126,14 @@ async def _app_error_handler(request: Request, exc: Exception) -> JSONResponse:
 
 async def _http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, StarletteHTTPException)
+    # Only plain-string details become the message; structured ones go to `details`.
+    has_text_detail = isinstance(exc.detail, str) and bool(exc.detail)
     return error_response(
         request,
         status_code=exc.status_code,
         code=_HTTP_CODES.get(exc.status_code, "http_error"),
-        message=str(exc.detail) if exc.detail else HTTPStatus(exc.status_code).phrase,
+        message=exc.detail if has_text_detail else HTTPStatus(exc.status_code).phrase,
+        details=None if has_text_detail else exc.detail or None,
         headers=exc.headers,
     )
 
@@ -135,13 +144,7 @@ async def _validation_error_handler(request: Request, exc: Exception) -> JSONRes
         {"loc": list(err.get("loc", ())), "msg": err.get("msg"), "type": err.get("type")}
         for err in exc.errors()
     ]
-    return error_response(
-        request,
-        status_code=422,
-        code="validation_error",
-        message="Request validation failed",
-        details=details,
-    )
+    return _render_app_error(request, ValidationFailedError(details=details))
 
 
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
