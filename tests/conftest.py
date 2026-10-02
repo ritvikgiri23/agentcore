@@ -6,7 +6,7 @@ os.environ["LLM_PROVIDER"] = "fake"
 os.environ.pop("OPENAI_API_KEY", None)
 
 import itertools  # noqa: E402
-from collections.abc import AsyncIterator, Awaitable  # noqa: E402
+from collections.abc import AsyncIterator, Awaitable, Iterator  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from typing import Protocol  # noqa: E402
 
@@ -30,6 +30,7 @@ from app.db.base import Base  # noqa: E402
 from app.db.session import get_db  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.models import User  # noqa: E402  (importing app.models registers every table)
+from app.tools import TOOL_REGISTRY, ToolContext  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -99,6 +100,22 @@ async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
+
+
+@pytest.fixture
+def isolated_registry() -> Iterator[None]:
+    """Let a test register its own tools without leaking them into other tests."""
+    saved = dict(TOOL_REGISTRY)
+    try:
+        yield
+    finally:
+        TOOL_REGISTRY.clear()
+        TOOL_REGISTRY.update(saved)
+
+
+@pytest.fixture
+def tool_context() -> ToolContext:
+    return ToolContext(user_id="test-user", run_id="test-run")
 
 
 @dataclass(frozen=True)
