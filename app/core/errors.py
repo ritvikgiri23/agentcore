@@ -73,6 +73,12 @@ class ValidationFailedError(AppError):
     message = "Request validation failed"
 
 
+class UnknownToolError(AppError):
+    status_code = 422
+    code = "unknown_tool"
+    message = "Unknown tools requested"
+
+
 # HTTPException status codes mapped to stable machine-readable codes.
 _HTTP_CODES: dict[int, str] = {
     400: "bad_request",

@@ -29,7 +29,8 @@ from app.core.security import create_access_token, hash_password  # noqa: E402
 from app.db.base import Base  # noqa: E402
 from app.db.session import get_db  # noqa: E402
 from app.main import create_app  # noqa: E402
-from app.models import User  # noqa: E402  (importing app.models registers every table)
+# Importing app.models registers every table.
+from app.models import AgentSession, User  # noqa: E402
 from app.tools import TOOL_REGISTRY, ToolContext  # noqa: E402
 
 
@@ -157,3 +158,38 @@ def user_factory(db_session: AsyncSession) -> UserFactory:
 @pytest.fixture
 async def authed_user(user_factory: UserFactory) -> AuthedUser:
     return await user_factory()
+
+
+class AgentSessionFactory(Protocol):
+    def __call__(
+        self,
+        owner: AuthedUser,
+        name: str = ...,
+        system_prompt: str = ...,
+        tools_enabled: list[str] | None = None,
+    ) -> Awaitable[AgentSession]: ...
+
+
+@pytest.fixture
+def agent_session_factory(db_session: AsyncSession) -> AgentSessionFactory:
+    """Create persisted agent sessions owned by the given user."""
+
+    async def make(
+        owner: AuthedUser,
+        name: str = "Research Assistant",
+        system_prompt: str = "You are a careful research assistant.",
+        tools_enabled: list[str] | None = None,
+    ) -> AgentSession:
+        if tools_enabled is None:
+            tools_enabled = ["web_search", "calculator"]
+        agent_session = AgentSession(
+            user_id=owner.user.id,
+            name=name,
+            system_prompt=system_prompt,
+            tools_enabled=tools_enabled,
+        )
+        db_session.add(agent_session)
+        await db_session.commit()
+        return agent_session
+
+    return make

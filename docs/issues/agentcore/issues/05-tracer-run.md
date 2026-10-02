@@ -20,3 +20,7 @@
 - [ ] Owned-run lookup joins through the session's user id; another user's run → 404 on status and steps
 - [ ] Logs bind run id and step type in the worker
 - [ ] Tests: HTTP seam — submit, execute in-process via the task's entry point, status before/after, step trace shape, session detail recent runs, 404 isolation; runner seam — plain answer stops, 10-iteration cap, second invocation on a completed run is a no-op; every published event corresponds to an already-persisted step
+
+## Comments
+
+- From ticket 04: `DELETE /sessions/{id}` deletes via the ORM (`db.delete(agent_session)`). When adding `AgentSession.runs` with `lazy="raise"`, also set `passive_deletes=True` so the database `ON DELETE CASCADE` does the work instead of SQLAlchemy trying to load the runs. `SessionDetail.recent_runs` / `RunSummary` already exist and only need populating.
