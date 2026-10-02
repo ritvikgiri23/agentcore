@@ -50,7 +50,7 @@ async def request_cancel(
 
     `revoke` is blocking: it runs in a worker thread.
     """
-    previous = await lifecycle.cancel(db, run_id)
+    previous = await lifecycle.cancel(db, redis, run_id)
     if previous is None:
         return None
     await redis.set(cancel_flag_key(run_id), reason.value, ex=CANCEL_FLAG_TTL_SECONDS)
@@ -96,7 +96,7 @@ async def settle(db: AsyncSession, redis: Redis, run_id: str) -> None:
     deleted with its session only gets its `done`, for anyone still watching. `done` may
     be published more than once; a stream ends at the first.
     """
-    await lifecycle.cancel(db, run_id)
+    await lifecycle.cancel(db, redis, run_id)
     status = await lifecycle.get_status(db, run_id)
     if status is None:
         logger.info("run_deleted", run_id=run_id)

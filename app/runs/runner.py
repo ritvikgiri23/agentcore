@@ -101,7 +101,7 @@ async def _claim_and_run(run_id: str, lease: RunLease, deps: RunnerDeps) -> None
         if agent_session is None:
             # Unreachable while the session FK cascades, but never strand a claimed run.
             logger.warning("run_session_missing")
-            if await lifecycle.fail(db, run_id):
+            if await lifecycle.fail(db, deps.redis, run_id):
                 await publish_done(deps.redis, run_id, RunStatus.FAILED)
             return
     structlog.contextvars.bind_contextvars(session_id=agent_session.id)
@@ -115,7 +115,7 @@ async def _fail_worker_lost(db: AsyncSession, run_id: str, deps: RunnerDeps) -> 
     await events.record(
         run_id, StepType.ERROR, {"type": "WorkerLost", "message": WORKER_LOST_MESSAGE}
     )
-    if await lifecycle.fail(db, run_id):
+    if await lifecycle.fail(db, deps.redis, run_id):
         await events.publish_done(run_id, RunStatus.FAILED)
 
 
@@ -357,6 +357,7 @@ class _AgentLoop:
         async with self._deps.session_factory() as db:
             completed = await lifecycle.complete(
                 db,
+                self._deps.redis,
                 self._run_id,
                 final_answer=content,
                 tokens_used=self._ctx.usage.total_tokens,
@@ -404,7 +405,7 @@ class _AgentLoop:
             logger.exception("run_error_step_not_recorded")
         async with self._deps.session_factory() as db:
             failed = await lifecycle.fail(
-                db, self._run_id, tokens_used=self._ctx.usage.total_tokens
+                db, self._deps.redis, self._run_id, tokens_used=self._ctx.usage.total_tokens
             )
         if not failed:
             logger.info("run_failure_skipped")

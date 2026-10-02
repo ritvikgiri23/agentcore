@@ -310,7 +310,7 @@ class _CancelledDuringCall:
         else:
             # Only the status changes, as if the flag were lost: the conditional terminal
             # write alone must keep the run cancelled.
-            await lifecycle.cancel(self._db, self._run_id)
+            await lifecycle.cancel(self._db, self._redis, self._run_id)
         return await self._llm.chat(messages, tools)
 
     async def aclose(self) -> None:

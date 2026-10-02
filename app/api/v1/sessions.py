@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from typing import Annotated, Any
 
 import structlog
@@ -8,12 +9,18 @@ from sqlalchemy import func, select
 
 from app.api.deps import CurrentUser, DbSession, Enqueuer, PageParams, RedisClient, Revoker
 from app.api.v1.runs import status_url, stream_url
-from app.core.errors import ErrorResponse, ServiceUnavailableError, UnknownToolError
+from app.core.config import get_settings
+from app.core.errors import (
+    ErrorResponse,
+    RateLimitedError,
+    ServiceUnavailableError,
+    UnknownToolError,
+)
 from app.memory import short_term
 from app.models import AgentRun, AgentSession, RunStatus
 from app.repositories.ownership import get_owned_session
 from app.core.redis import get_redis
-from app.runs import cancellation, lifecycle
+from app.runs import admission, cancellation, lifecycle
 from app.runs.events import publish_done
 from app.schemas.pagination import Page
 from app.schemas.runs import RunAccepted, RunCreate
@@ -160,6 +167,7 @@ async def delete_session(
         **_UNAUTHORIZED,
         **_NOT_FOUND,
         422: {"model": ErrorResponse, "description": "Invalid message"},
+        429: {"model": ErrorResponse, "description": "Too many queued or running runs"},
         503: {"model": ErrorResponse, "description": "The run could not be queued"},
     },
 )
@@ -172,17 +180,29 @@ async def submit_run(
     enqueue: Enqueuer,
 ) -> RunAccepted:
     agent_session = await get_owned_session(db, user.id, session_id)
-    run = AgentRun(session_id=agent_session.id, user_message=body.message)
+    run_id = str(uuid.uuid4())
+    limit = get_settings().max_active_runs_per_user
+    if not await admission.admit(db, redis, user.id, run_id, limit=limit):
+        logger.info("run_rate_limited", limit=limit)
+        raise RateLimitedError(
+            f"At most {limit} runs can be queued or running at once; wait for one to finish",
+            details={"limit": limit},
+        )
+    run = AgentRun(id=run_id, session_id=agent_session.id, user_message=body.message)
     db.add(run)
-    # Committed before enqueueing, so the worker can always find the run.
-    await db.commit()
+    try:
+        # Committed before enqueueing, so the worker can always find the run.
+        await db.commit()
+    except Exception:
+        await admission.release(redis, user.id, run_id)
+        raise
     structlog.contextvars.bind_contextvars(run_id=run.id)
     try:
         # Publishing to the broker is blocking network I/O.
         await asyncio.to_thread(enqueue, run.id)
     except Exception:
         logger.exception("run_enqueue_failed")
-        if await lifecycle.fail(db, run.id):
+        if await lifecycle.fail(db, redis, run.id):
             await publish_done(redis, run.id, RunStatus.FAILED)
         raise ServiceUnavailableError(
             "The run could not be queued; try again", details={"run_id": run.id}
