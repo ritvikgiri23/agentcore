@@ -52,3 +52,13 @@ files = ["app", "tests", "alembic"]
 [[tool.mypy.overrides]]
 module = ["celery.*", "fakeredis.*", "pgvector.*"]
 ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["app"]
+# SQLAlchemy's asyncio layer runs ORM code in greenlets; trace them too.
+concurrency = ["greenlet", "thread"]
+
+[tool.coverage.report]
+fail_under = 75
+skip_covered = true
+show_missing = true

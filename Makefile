@@ -15,9 +15,9 @@ down: ## Stop the stack
 logs: ## Tail API and worker logs
 	$(COMPOSE) logs -f api worker
 
-test: ## Run the test suite in a container against the compose Postgres
+test: ## Run the test suite (with a coverage report) in a container against the compose Postgres
 	$(COMPOSE_DEV) up -d --wait postgres
-	$(COMPOSE_DEV) run --rm --build --no-deps api pytest $(ARGS)
+	$(COMPOSE_DEV) run --rm --build --no-deps api pytest --cov $(ARGS)
 
 migrate: ## Apply database migrations
 	$(COMPOSE) run --rm migrate
